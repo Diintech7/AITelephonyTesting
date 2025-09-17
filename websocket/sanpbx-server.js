@@ -120,7 +120,7 @@ const respondWithOpenAI = async (userMessage, history = []) => {
 
 const connectDeepgram = (language = STATIC.deepgramLanguage) => {
   const url = new URL("wss://api.deepgram.com/v1/listen")
-  url.searchParams.append("sample_rate", "8000")
+  url.searchParams.append("sample_rate", "44100")
   url.searchParams.append("channels", "1")
   url.searchParams.append("encoding", "linear16")
   url.searchParams.append("model", "nova-2")
