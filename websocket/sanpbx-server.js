@@ -291,7 +291,7 @@ const setupSanPbxWebSocketServer = (ws) => {
           const transcript = msg.channel?.alternatives?.[0]?.transcript || ""
           if (transcript) {
             if (msg.is_final) await handleTranscript(transcript)
-            else console.log(`[DEEPGRAM-INTERIM] ${transcript}`)
+            else console.log(`[${ts()}] [DEEPGRAM-INTERIM] ${transcript}`)
           }
         }
       } catch (_) {}
