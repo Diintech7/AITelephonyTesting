@@ -182,8 +182,6 @@ const connectDeepgram = (language = STATIC.deepgramLanguage) => {
   url.searchParams.append("encoding", "linear16")
   url.searchParams.append("model", "nova-2")
   url.searchParams.append("language", language)
-  url.searchParams.append("interim_results", "true")
-  url.searchParams.append("endpointing", "200")
   const wsUrl = url.toString()
   console.log(`[${ts()}] [DEEPGRAM-CONNECT] ${wsUrl}`)
   return new WebSocket(wsUrl, { headers: { Authorization: `Token ${API_KEYS.deepgram}` } })
