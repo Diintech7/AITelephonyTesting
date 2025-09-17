@@ -128,7 +128,9 @@ const connectDeepgram = (language = STATIC.deepgramLanguage) => {
   url.searchParams.append("interim_results", "true")
   url.searchParams.append("smart_format", "true")
   url.searchParams.append("endpointing", "300")
-  return new WebSocket(url.toString(), { headers: { Authorization: `Token ${API_KEYS.deepgram}` } })
+  const wsUrl = url.toString()
+  console.log(`[DEEPGRAM-CONNECT] ${wsUrl}`)
+  return new WebSocket(wsUrl, { headers: { Authorization: `Token ${API_KEYS.deepgram}` } })
 }
 
 const setupSanPbxWebSocketServer = (ws) => {
@@ -150,6 +152,7 @@ const setupSanPbxWebSocketServer = (ws) => {
     try {
       const clean = (text || "").trim()
       if (!clean) return
+      console.log(`[DEEPGRAM-FINAL] ${clean}`)
       history.push({ role: "user", content: clean })
       const reply = await respondWithOpenAI(clean, history)
       if (reply) {
@@ -164,6 +167,7 @@ const setupSanPbxWebSocketServer = (ws) => {
     deepgramWs = connectDeepgram()
     deepgramWs.onopen = () => {
       deepgramReady = true
+      console.log("🎤 [DEEPGRAM] open; queued_packets=", dgQueue.length)
       if (dgQueue.length) { dgQueue.forEach((b) => deepgramWs.send(b)); dgQueue = [] }
     }
     deepgramWs.onmessage = async (evt) => {
@@ -171,12 +175,15 @@ const setupSanPbxWebSocketServer = (ws) => {
         const msg = JSON.parse(evt.data)
         if (msg.type === "Results") {
           const transcript = msg.channel?.alternatives?.[0]?.transcript || ""
-          if (transcript && msg.is_final) await handleTranscript(transcript)
+          if (transcript) {
+            if (msg.is_final) await handleTranscript(transcript)
+            else console.log(`[DEEPGRAM-INTERIM] ${transcript}`)
+          }
         }
       } catch (_) {}
     }
-    deepgramWs.onerror = () => { deepgramReady = false }
-    deepgramWs.onclose = () => { deepgramReady = false }
+    deepgramWs.onerror = (e) => { deepgramReady = false; console.log("❌ [DEEPGRAM] error", e?.message || "") }
+    deepgramWs.onclose = () => { deepgramReady = false; console.log("🔌 [DEEPGRAM] closed") }
   }
 
   ws.on("message", async (message) => {
@@ -185,8 +192,10 @@ const setupSanPbxWebSocketServer = (ws) => {
       const data = JSON.parse(text)
       switch (data.event) {
         case "connected":
+          console.log("🔗 [SANPBX] connected")
           break
         case "start":
+          console.log("📞 [SANPBX] start", JSON.stringify({ streamId: data.streamId, callId: data.callId, channelId: data.channelId }))
           ids.streamId = data.streamId
           ids.callId = data.callId
           ids.channelId = data.channelId
@@ -197,11 +206,18 @@ const setupSanPbxWebSocketServer = (ws) => {
         case "media":
           if (data.payload) {
             const audioBuffer = Buffer.from(data.payload, 'base64')
+            if (!ws.mediaPacketCount) ws.mediaPacketCount = 0
+            ws.mediaPacketCount++
+            if (ws.mediaPacketCount % 1000 === 0) console.log("🎵 [SANPBX-MEDIA] packets=", ws.mediaPacketCount)
             if (deepgramWs && deepgramReady && deepgramWs.readyState === WebSocket.OPEN) deepgramWs.send(audioBuffer)
-            else dgQueue.push(audioBuffer)
+            else {
+              dgQueue.push(audioBuffer)
+              if (dgQueue.length % 100 === 0) console.log("⏳ [DEEPGRAM-QUEUE] queued_packets=", dgQueue.length)
+            }
           }
           break
         case "stop":
+          console.log("🛑 [SANPBX] stop")
           if (deepgramWs && deepgramWs.readyState === WebSocket.OPEN) deepgramWs.close()
           break
         default:
@@ -211,6 +227,7 @@ const setupSanPbxWebSocketServer = (ws) => {
   })
 
   ws.on("close", () => {
+    console.log("🔌 [SANPBX] ws closed")
     if (deepgramWs && deepgramWs.readyState === WebSocket.OPEN) deepgramWs.close()
   })
 
@@ -218,5 +235,3 @@ const setupSanPbxWebSocketServer = (ws) => {
 }
 
 module.exports = { setupSanPbxWebSocketServer }
-
-
