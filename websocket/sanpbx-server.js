@@ -213,14 +213,36 @@ const setupSanPbxWebSocketServer = (ws) => {
     } catch (_) {}
   }
 
-  // Simple TTS queue to serialize playback for streaming partials
+  // TTS aggregation and queue (merge small chunks, debounce flush)
   let ttsQueue = []
   let ttsBusy = false
-  const enqueueTTS = (text) => {
-    if (!text || !text.trim()) return
-    ttsQueue.push(text.trim())
-    console.log(`[${ts()}] [TTS-QUEUE] enqueue len=${text.trim().length} queue=${ttsQueue.length}`)
+  let speakBuffer = ""
+  let speakDebounceTimer = null
+  const PUNCTUATION_FLUSH = /([.!?]\s?$|[;:，。！？]$|\n\s*$)/
+  const flushSpeakBuffer = (reason = "debounce") => {
+    const chunk = speakBuffer.trim()
+    speakBuffer = ""
+    if (!chunk) return
+    ttsQueue.push(chunk)
+    console.log(`[${ts()}] [TTS-QUEUE] flush(${reason}) len=${chunk.length} queue=${ttsQueue.length}`)
     if (!ttsBusy) processTTSQueue().catch(() => {})
+  }
+  const queueSpeech = (text, force = false) => {
+    if (!text || !text.trim()) return
+    const incoming = text
+    // Merge into buffer
+    speakBuffer += (speakBuffer ? " " : "") + incoming
+    const bufLen = speakBuffer.length
+    const wordCount = speakBuffer.trim().split(/\s+/).length
+    const shouldImmediate = force || PUNCTUATION_FLUSH.test(speakBuffer) || bufLen >= 80 || wordCount >= 8
+    if (shouldImmediate) {
+      if (speakDebounceTimer) { clearTimeout(speakDebounceTimer); speakDebounceTimer = null }
+      flushSpeakBuffer(shouldImmediate === true ? "force" : "threshold")
+      return
+    }
+    // Debounce to merge tiny fragments
+    if (speakDebounceTimer) clearTimeout(speakDebounceTimer)
+    speakDebounceTimer = setTimeout(() => flushSpeakBuffer("debounce"), 300)
   }
   const processTTSQueue = async () => {
     if (ttsBusy) return
@@ -232,8 +254,6 @@ const setupSanPbxWebSocketServer = (ws) => {
         const pcm = await ttsWithSarvam(item)
         await streamPcmToSanPBX(ws, ids, pcm)
         console.log(`[${ts()}] [TTS-PLAY] end len=${item.length}`)
-        // brief gap to avoid boundary artifacts
-        await new Promise(r => setTimeout(r, 50))
       }
     } catch (e) {
       console.log(`[${ts()}] [TTS-PLAY] error ${e.message}`)
@@ -251,8 +271,9 @@ const setupSanPbxWebSocketServer = (ws) => {
       let lastLen = 0
       const shouldFlush = (prev, curr, delta) => {
         const diff = curr.slice(prev)
-        // Flush earlier on small deltas or accumulated chars
-        if ((delta && delta.length >= 12) || diff.length >= 24) return true
+        // Safer flushing: min words or punctuation, or large delta
+        const words = diff.trim().split(/\s+/).filter(Boolean).length
+        if ((delta && delta.length >= 20) || words >= 3) return true
         return /[.!?]\s?$/.test(curr) || /\n\s*$/.test(curr)
       }
       const finalText = await respondWithOpenAIStream(clean, history, async (accum, delta) => {
@@ -262,14 +283,14 @@ const setupSanPbxWebSocketServer = (ws) => {
         lastLen = accum.length
         if (chunk) {
           console.log(`[${ts()}] [LLM-FLUSH] chunk_len=${chunk.length}`)
-          enqueueTTS(chunk)
+          queueSpeech(chunk, false)
         }
       })
       if (finalText && finalText.length > lastLen) {
         const tail = finalText.slice(lastLen).trim()
         if (tail) {
           console.log(`[${ts()}] [LLM-FLUSH] tail_len=${tail.length}`)
-          enqueueTTS(tail)
+          queueSpeech(tail, true)
         }
       }
       if (finalText) history.push({ role: "assistant", content: finalText })
@@ -322,8 +343,8 @@ const setupSanPbxWebSocketServer = (ws) => {
                     if (!delta) return
                     const out = delta.trim()
                     if (!out) return
-                    // Flush very aggressively for interims
-                    enqueueTTS(out)
+                    // Route interims into buffered speech aggregator
+                    queueSpeech(out, false)
                   })
                 } catch (_) {
                 } finally {
