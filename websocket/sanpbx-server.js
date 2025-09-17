@@ -219,10 +219,17 @@ const setupSanPbxWebSocketServer = (ws) => {
   let speakBuffer = ""
   let speakDebounceTimer = null
   const PUNCTUATION_FLUSH = /([.!?]\s?$|[;:，。！？]$|\n\s*$)/
+  const MIN_TTS_CHARS = 10
+  const BUFFER_DEBOUNCE_MS = 180
   const flushSpeakBuffer = (reason = "debounce") => {
     const chunk = speakBuffer.trim()
     speakBuffer = ""
     if (!chunk) return
+    if (chunk.length < MIN_TTS_CHARS && reason !== "punct" && reason !== "force") {
+      // too small; rebuffer and wait for more
+      speakBuffer = chunk
+      return
+    }
     ttsQueue.push(chunk)
     console.log(`[${ts()}] [TTS-QUEUE] flush(${reason}) len=${chunk.length} queue=${ttsQueue.length}`)
     if (!ttsBusy) processTTSQueue().catch(() => {})
@@ -234,15 +241,16 @@ const setupSanPbxWebSocketServer = (ws) => {
     speakBuffer += (speakBuffer ? " " : "") + incoming
     const bufLen = speakBuffer.length
     const wordCount = speakBuffer.trim().split(/\s+/).length
-    const shouldImmediate = force || PUNCTUATION_FLUSH.test(speakBuffer) || bufLen >= 80 || wordCount >= 8
+    const punctNow = PUNCTUATION_FLUSH.test(speakBuffer)
+    const shouldImmediate = force || punctNow || bufLen >= 100 || wordCount >= 10
     if (shouldImmediate) {
       if (speakDebounceTimer) { clearTimeout(speakDebounceTimer); speakDebounceTimer = null }
-      flushSpeakBuffer(shouldImmediate === true ? "force" : "threshold")
+      flushSpeakBuffer(punctNow ? "punct" : (force ? "force" : "threshold"))
       return
     }
     // Debounce to merge tiny fragments
     if (speakDebounceTimer) clearTimeout(speakDebounceTimer)
-    speakDebounceTimer = setTimeout(() => flushSpeakBuffer("debounce"), 300)
+    speakDebounceTimer = setTimeout(() => flushSpeakBuffer("debounce"), BUFFER_DEBOUNCE_MS)
   }
   const processTTSQueue = async () => {
     if (ttsBusy) return
@@ -271,9 +279,9 @@ const setupSanPbxWebSocketServer = (ws) => {
       let lastLen = 0
       const shouldFlush = (prev, curr, delta) => {
         const diff = curr.slice(prev)
-        // Safer flushing: min words or punctuation, or large delta
+        // Safer flushing: min words or punctuation, or larger delta
         const words = diff.trim().split(/\s+/).filter(Boolean).length
-        if ((delta && delta.length >= 20) || words >= 3) return true
+        if ((delta && delta.length >= 30) || words >= 3) return true
         return /[.!?]\s?$/.test(curr) || /\n\s*$/.test(curr)
       }
       const finalText = await respondWithOpenAIStream(clean, history, async (accum, delta) => {
