@@ -182,6 +182,7 @@ const connectDeepgram = (language = STATIC.deepgramLanguage) => {
   url.searchParams.append("encoding", "linear16")
   url.searchParams.append("model", "nova-2")
   url.searchParams.append("language", language)
+  url.searchParams.append("interim_results", "true")
   const wsUrl = url.toString()
   console.log(`[${ts()}] [DEEPGRAM-CONNECT] ${wsUrl}`)
   return new WebSocket(wsUrl, { headers: { Authorization: `Token ${API_KEYS.deepgram}` } })
@@ -193,6 +194,11 @@ const setupSanPbxWebSocketServer = (ws) => {
   let deepgramReady = false
   let dgQueue = []
   let history = []
+  // STT latency markers
+  let sttStartTs = null
+  let firstMediaTs = null
+  let firstForwardToDgTs = null
+  let firstDgMsgTs = null
 
   const sendGreeting = async () => {
     try {
@@ -240,7 +246,8 @@ const setupSanPbxWebSocketServer = (ws) => {
       let lastLen = 0
       const shouldFlush = (prev, curr, delta) => {
         const diff = curr.slice(prev)
-        if (diff.length >= 60) return true
+        // Flush earlier on small deltas or accumulated chars
+        if ((delta && delta.length >= 12) || diff.length >= 24) return true
         return /[.!?]\s?$/.test(curr) || /\n\s*$/.test(curr)
       }
       const finalText = await respondWithOpenAIStream(clean, history, async (accum, delta) => {
@@ -275,6 +282,12 @@ const setupSanPbxWebSocketServer = (ws) => {
       try {
         const msg = JSON.parse(evt.data)
         if (msg.type === "Results") {
+          if (!firstDgMsgTs) {
+            firstDgMsgTs = Date.now()
+            const latFromStart = sttStartTs ? (firstDgMsgTs - sttStartTs) : null
+            const latFromFirstForward = firstForwardToDgTs ? (firstDgMsgTs - firstForwardToDgTs) : null
+            console.log(`[${ts()}] [DEEPGRAM-LAT] first_result_ms_from_start=${latFromStart != null ? latFromStart : 'n/a'} from_first_forward_ms=${latFromFirstForward != null ? latFromFirstForward : 'n/a'}`)
+          }
           const transcript = msg.channel?.alternatives?.[0]?.transcript || ""
           if (transcript) {
             if (msg.is_final) await handleTranscript(transcript)
@@ -301,6 +314,10 @@ const setupSanPbxWebSocketServer = (ws) => {
           ids.callId = data.callId
           ids.channelId = data.channelId
           history = []
+          sttStartTs = Date.now()
+          firstMediaTs = null
+          firstForwardToDgTs = null
+          firstDgMsgTs = null
           bootDeepgram()
           await sendGreeting()
           break
@@ -310,8 +327,19 @@ const setupSanPbxWebSocketServer = (ws) => {
             if (!ws.mediaPacketCount) ws.mediaPacketCount = 0
             ws.mediaPacketCount++
             if (ws.mediaPacketCount % 1000 === 0) console.log(`[${ts()}] 🎵 [SANPBX-MEDIA] packets=${ws.mediaPacketCount}`)
-            if (deepgramWs && deepgramReady && deepgramWs.readyState === WebSocket.OPEN) deepgramWs.send(audioBuffer)
-            else {
+            if (!firstMediaTs) {
+              firstMediaTs = Date.now()
+              const latFromStart = sttStartTs ? (firstMediaTs - sttStartTs) : null
+              console.log(`[${ts()}] [STT-LAT] first_media_recv_ms_from_start=${latFromStart != null ? latFromStart : 'n/a'}`)
+            }
+            if (deepgramWs && deepgramReady && deepgramWs.readyState === WebSocket.OPEN) {
+              if (!firstForwardToDgTs) {
+                firstForwardToDgTs = Date.now()
+                const latMediaToForward = firstMediaTs ? (firstForwardToDgTs - firstMediaTs) : null
+                console.log(`[${ts()}] [STT-LAT] first_forward_to_deepgram_ms_from_first_media=${latMediaToForward != null ? latMediaToForward : 'n/a'}`)
+              }
+              deepgramWs.send(audioBuffer)
+            } else {
               dgQueue.push(audioBuffer)
               if (dgQueue.length % 100 === 0) console.log(`[${ts()}] ⏳ [DEEPGRAM-QUEUE] queued_packets=${dgQueue.length}`)
             }
