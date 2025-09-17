@@ -199,6 +199,11 @@ const setupSanPbxWebSocketServer = (ws) => {
   let firstMediaTs = null
   let firstForwardToDgTs = null
   let firstDgMsgTs = null
+  // Interim streaming controls
+  let interimDebounceTimer = null
+  let interimPendingText = ""
+  let interimSessionId = 0
+  let interimActive = false
 
   const sendGreeting = async () => {
     try {
@@ -290,8 +295,43 @@ const setupSanPbxWebSocketServer = (ws) => {
           }
           const transcript = msg.channel?.alternatives?.[0]?.transcript || ""
           if (transcript) {
-            if (msg.is_final) await handleTranscript(transcript)
-            else console.log(`[${ts()}] [DEEPGRAM-INTERIM] ${transcript}`)
+            if (msg.is_final) {
+              // cancel any interim streaming callbacks
+              interimSessionId++
+              if (interimDebounceTimer) { clearTimeout(interimDebounceTimer); interimDebounceTimer = null }
+              interimActive = false
+              await handleTranscript(transcript)
+            } else {
+              console.log(`[${ts()}] [DEEPGRAM-INTERIM] ${transcript}`)
+              // Debounce interim-driven LLM streaming
+              interimPendingText = transcript
+              if (interimDebounceTimer) clearTimeout(interimDebounceTimer)
+              interimDebounceTimer = setTimeout(async () => {
+                // If an interim stream is already active, skip new launch
+                if (interimActive) {
+                  console.log(`[${ts()}] [LLM-INTERIM] skip_launch active=true`)
+                  return
+                }
+                interimActive = true
+                const session = ++interimSessionId
+                const seed = interimPendingText
+                console.log(`[${ts()}] [LLM-INTERIM] launch session=${session} seed_len=${seed.length}`)
+                try {
+                  await respondWithOpenAIStream(seed, history, async (accum, delta) => {
+                    if (interimSessionId !== session) return
+                    if (!delta) return
+                    const out = delta.trim()
+                    if (!out) return
+                    // Flush very aggressively for interims
+                    enqueueTTS(out)
+                  })
+                } catch (_) {
+                } finally {
+                  if (interimSessionId === session) interimActive = false
+                  console.log(`[${ts()}] [LLM-INTERIM] end session=${session}`)
+                }
+              }, 450)
+            }
           }
         }
       } catch (_) {}
