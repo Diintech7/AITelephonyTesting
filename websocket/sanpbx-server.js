@@ -1624,7 +1624,7 @@ const setupSanPbxWebSocketServer = (ws) => {
       const deepgramLanguage = getDeepgramLanguage(currentLanguage)
 
       const deepgramUrl = new URL("wss://api.deepgram.com/v1/listen")
-        deepgramUrl.searchParams.append("sample_rate", "8000")
+        deepgramUrl.searchParams.append("sample_rate", "44100")
         deepgramUrl.searchParams.append("channels", "1")
         deepgramUrl.searchParams.append("encoding", "linear16")
         deepgramUrl.searchParams.append("model", "nova-2")
