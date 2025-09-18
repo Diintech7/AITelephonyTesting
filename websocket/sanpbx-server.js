@@ -28,6 +28,17 @@ const STATIC = {
   firstMessage: "Hello! How can I help you today?",
 }
 
+// Latency optimization constants
+const LATENCY_CONFIG = {
+  INTERIM_MIN_WORDS: 2,           // Minimum words to trigger interim processing
+  INTERIM_DEBOUNCE_MS: 150,       // Reduced from 450ms
+  CONFIDENCE_THRESHOLD: 0.7,       // Minimum confidence for interim processing
+  WORD_ACCUMULATION_MS: 200,      // Time to accumulate words before sending to LLM
+  TTS_MIN_CHARS: 8,              // Reduced from 10
+  TTS_DEBOUNCE_MS: 120,          // Reduced from 180ms
+  SILENCE_DETECTION_MS: 300,      // Stop TTS if user starts speaking
+}
+
 // Timestamp helper with milliseconds
 const ts = () => new Date().toISOString()
 
@@ -59,27 +70,47 @@ const extractPcmLinear16Mono8kBase64 = (audioBase64) => {
   }
 }
 
-const streamPcmToSanPBX = async (ws, { streamId, callId, channelId }, pcmBase64) => {
-  if (!ws || ws.readyState !== WebSocket.OPEN) return
-  if (!streamId || !callId || !channelId) return
+const streamPcmToSanPBX = async (ws, { streamId, callId, channelId }, pcmBase64, sessionId) => {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return false
+  if (!streamId || !callId || !channelId) return false
+  
   const CHUNK_SIZE = 320
   const audioBuffer = Buffer.from(pcmBase64, 'base64')
   let position = 0
+  
   while (position < audioBuffer.length && ws.readyState === WebSocket.OPEN) {
+    // Check if this TTS session is still valid (not cancelled by new user input)
+    if (sessionId && ws.currentTTSSession !== sessionId) {
+      console.log(`[${ts()}] [TTS-CANCEL] session=${sessionId} cancelled`)
+      return false
+    }
+    
     const chunk = audioBuffer.slice(position, position + CHUNK_SIZE)
     const padded = chunk.length < CHUNK_SIZE ? Buffer.concat([chunk, Buffer.alloc(CHUNK_SIZE - chunk.length)]) : chunk
     const message = { event: "reverse-media", payload: padded.toString('base64'), streamId, channelId, callId }
-    try { ws.send(JSON.stringify(message)) } catch (_) { break }
+    
+    try { 
+      ws.send(JSON.stringify(message)) 
+    } catch (_) { 
+      return false 
+    }
+    
     position += CHUNK_SIZE
     if (position < audioBuffer.length) await new Promise(r => setTimeout(r, 20))
   }
-  try {
-    for (let i = 0; i < 3; i++) {
-      const silence = Buffer.alloc(CHUNK_SIZE).toString('base64')
-      ws.send(JSON.stringify({ event: "reverse-media", payload: silence, streamId, channelId, callId }))
-      await new Promise(r => setTimeout(r, 20))
-    }
-  } catch (_) {}
+  
+  // Send silence frames only if session is still valid
+  if (!sessionId || ws.currentTTSSession === sessionId) {
+    try {
+      for (let i = 0; i < 2; i++) { // Reduced from 3
+        const silence = Buffer.alloc(CHUNK_SIZE).toString('base64')
+        ws.send(JSON.stringify({ event: "reverse-media", payload: silence, streamId, channelId, callId }))
+        await new Promise(r => setTimeout(r, 20))
+      }
+    } catch (_) {}
+  }
+  
+  return true
 }
 
 const ttsWithSarvam = async (text) => {
@@ -91,7 +122,7 @@ const ttsWithSarvam = async (text) => {
       target_language_code: STATIC.sarvamLanguage,
       speaker: STATIC.sarvamVoice,
       pitch: 0,
-      pace: 1.0,
+      pace: 1.1, // Slightly faster pace
       loudness: 1.0,
       speech_sample_rate: 8000,
       enable_preprocessing: true,
@@ -114,46 +145,58 @@ const respondWithOpenAI = async (userMessage, history = []) => {
   const res = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${API_KEYS.openai}` },
-    body: JSON.stringify({ model: "gpt-4o-mini", messages, max_tokens: 120, temperature: 0.3 }),
+    body: JSON.stringify({ model: "gpt-4o-mini", messages, max_tokens: 100, temperature: 0.2 }), // Reduced tokens and temp
   })
   if (!res.ok) throw new Error(`OpenAI error: ${res.status}`)
   const data = await res.json()
   return (data.choices?.[0]?.message?.content || "").trim()
 }
 
-// OpenAI streaming with SSE; calls onPartial(accumulated, delta)
-const respondWithOpenAIStream = async (userMessage, history = [], onPartial = null) => {
+// Optimized OpenAI streaming with faster response triggers
+const respondWithOpenAIStream = async (userMessage, history = [], onPartial = null, sessionId = null) => {
   const messages = [
     { role: "system", content: STATIC.systemPrompt },
     ...history.slice(-6),
     { role: "user", content: userMessage },
   ]
-  console.log(`[${ts()}] [LLM-STREAM] start`)
+  
+  console.log(`[${ts()}] [LLM-STREAM] start session=${sessionId || 'none'}`)
   const res = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${API_KEYS.openai}` },
-    body: JSON.stringify({ model: "gpt-4o-mini", messages, max_tokens: 120, temperature: 0.3, stream: true }),
+    body: JSON.stringify({ 
+      model: "gpt-4o-mini", 
+      messages, 
+      max_tokens: 100, 
+      temperature: 0.2,
+      stream: true 
+    }),
   })
+  
   if (!res.ok || !res.body) {
     console.log(`[${ts()}] [LLM-STREAM] http_error status=${res.status}`)
     return null
   }
+  
   const reader = res.body.getReader()
   const decoder = new TextDecoder("utf-8")
   let buffer = ""
   let accumulated = ""
   let firstTokenLogged = false
+  
   while (true) {
     const { value, done } = await reader.read()
     if (done) break
+    
     buffer += decoder.decode(value, { stream: true })
     const lines = buffer.split(/\r?\n/)
     buffer = lines.pop() || ""
+    
     for (const line of lines) {
       const trimmed = line.trim()
       if (!trimmed) continue
       if (trimmed === "data: [DONE]") {
-        console.log(`[${ts()}] [LLM-STREAM] done_marker`)
+        console.log(`[${ts()}] [LLM-STREAM] done_marker session=${sessionId || 'none'}`)
         break
       }
       if (trimmed.startsWith("data:")) {
@@ -161,17 +204,23 @@ const respondWithOpenAIStream = async (userMessage, history = [], onPartial = nu
           const json = JSON.parse(trimmed.slice(5).trim())
           const delta = json.choices?.[0]?.delta?.content || ""
           if (delta) {
-            if (!firstTokenLogged) { firstTokenLogged = true; console.log(`[${ts()}] [LLM-STREAM] first_token`) }
+            if (!firstTokenLogged) { 
+              firstTokenLogged = true
+              console.log(`[${ts()}] [LLM-STREAM] first_token session=${sessionId || 'none'}`) 
+            }
             accumulated += delta
             if (typeof onPartial === "function") {
-              try { await onPartial(accumulated, delta) } catch (_) {}
+              try { 
+                await onPartial(accumulated, delta, sessionId) 
+              } catch (_) {}
             }
           }
         } catch (_) {}
       }
     }
   }
-  console.log(`[${ts()}] [LLM-STREAM] completed chars=${accumulated.length}`)
+  
+  console.log(`[${ts()}] [LLM-STREAM] completed chars=${accumulated.length} session=${sessionId || 'none'}`)
   return accumulated || null
 }
 
@@ -183,6 +232,12 @@ const connectDeepgram = (language = STATIC.deepgramLanguage) => {
   url.searchParams.append("model", "nova-2")
   url.searchParams.append("language", language)
   url.searchParams.append("interim_results", "true")
+  url.searchParams.append("smart_format", "true")
+  url.searchParams.append("punctuate", "true")
+  // Optimize for low latency
+  url.searchParams.append("endpointing", "100") // Faster endpoint detection
+  url.searchParams.append("utterance_end_ms", "800") // Reduced from default
+  
   const wsUrl = url.toString()
   console.log(`[${ts()}] [DEEPGRAM-CONNECT] ${wsUrl}`)
   return new WebSocket(wsUrl, { headers: { Authorization: `Token ${API_KEYS.deepgram}` } })
@@ -194,74 +249,106 @@ const setupSanPbxWebSocketServer = (ws) => {
   let deepgramReady = false
   let dgQueue = []
   let history = []
+  
+  // Enhanced session management
+  let currentLLMSession = 0
+  let currentTTSSession = 0
+  ws.currentTTSSession = 0
+  
   // STT latency markers
   let sttStartTs = null
   let firstMediaTs = null
   let firstForwardToDgTs = null
   let firstDgMsgTs = null
-  // Interim streaming controls
-  let interimDebounceTimer = null
-  let interimPendingText = ""
-  let interimSessionId = 0
-  let interimActive = false
-
+  
+  // Interim processing state
+  let interimBuffer = ""
+  let interimWordCount = 0
+  let lastInterimTime = 0
+  let interimProcessingActive = false
+  let wordAccumulationTimer = null
+  
+  // User speech detection
+  let userSpeechDetected = false
+  let lastUserInputTime = 0
+  
   const sendGreeting = async () => {
     try {
+      const sessionId = ++currentTTSSession
+      ws.currentTTSSession = sessionId
       const pcm = await ttsWithSarvam(STATIC.firstMessage)
-      await streamPcmToSanPBX(ws, ids, pcm)
+      await streamPcmToSanPBX(ws, ids, pcm, sessionId)
       history.push({ role: "assistant", content: STATIC.firstMessage })
     } catch (_) {}
   }
 
-  // TTS aggregation and queue (merge small chunks, debounce flush)
+  // Enhanced TTS queue with better cancellation
   let ttsQueue = []
   let ttsBusy = false
   let speakBuffer = ""
   let speakDebounceTimer = null
   const PUNCTUATION_FLUSH = /([.!?]\s?$|[;:，。！？]$|\n\s*$)/
-  const MIN_TTS_CHARS = 10
-  const BUFFER_DEBOUNCE_MS = 180
+  
   const flushSpeakBuffer = (reason = "debounce") => {
     const chunk = speakBuffer.trim()
     speakBuffer = ""
     if (!chunk) return
-    if (chunk.length < MIN_TTS_CHARS && reason !== "punct" && reason !== "force") {
-      // too small; rebuffer and wait for more
+    
+    if (chunk.length < LATENCY_CONFIG.TTS_MIN_CHARS && reason !== "punct" && reason !== "force") {
       speakBuffer = chunk
       return
     }
+    
     ttsQueue.push(chunk)
     console.log(`[${ts()}] [TTS-QUEUE] flush(${reason}) len=${chunk.length} queue=${ttsQueue.length}`)
     if (!ttsBusy) processTTSQueue().catch(() => {})
   }
+  
   const queueSpeech = (text, force = false) => {
     if (!text || !text.trim()) return
+    
+    // Cancel if user is speaking
+    if (userSpeechDetected && Date.now() - lastUserInputTime < LATENCY_CONFIG.SILENCE_DETECTION_MS) {
+      console.log(`[${ts()}] [TTS-SKIP] user_speaking`)
+      return
+    }
+    
     const incoming = text
-    // Merge into buffer
     speakBuffer += (speakBuffer ? " " : "") + incoming
     const bufLen = speakBuffer.length
     const wordCount = speakBuffer.trim().split(/\s+/).length
     const punctNow = PUNCTUATION_FLUSH.test(speakBuffer)
-    const shouldImmediate = force || punctNow || bufLen >= 100 || wordCount >= 10
+    const shouldImmediate = force || punctNow || bufLen >= 60 || wordCount >= 8 // Reduced thresholds
+    
     if (shouldImmediate) {
       if (speakDebounceTimer) { clearTimeout(speakDebounceTimer); speakDebounceTimer = null }
       flushSpeakBuffer(punctNow ? "punct" : (force ? "force" : "threshold"))
       return
     }
-    // Debounce to merge tiny fragments
+    
     if (speakDebounceTimer) clearTimeout(speakDebounceTimer)
-    speakDebounceTimer = setTimeout(() => flushSpeakBuffer("debounce"), BUFFER_DEBOUNCE_MS)
+    speakDebounceTimer = setTimeout(() => flushSpeakBuffer("debounce"), LATENCY_CONFIG.TTS_DEBOUNCE_MS)
   }
+  
   const processTTSQueue = async () => {
     if (ttsBusy) return
     ttsBusy = true
     try {
       while (ttsQueue.length > 0) {
         const item = ttsQueue.shift()
-        console.log(`[${ts()}] [TTS-PLAY] start len=${item.length}`)
+        const sessionId = ++currentTTSSession
+        ws.currentTTSSession = sessionId
+        
+        console.log(`[${ts()}] [TTS-PLAY] start len=${item.length} session=${sessionId}`)
         const pcm = await ttsWithSarvam(item)
-        await streamPcmToSanPBX(ws, ids, pcm)
-        console.log(`[${ts()}] [TTS-PLAY] end len=${item.length}`)
+        const success = await streamPcmToSanPBX(ws, ids, pcm, sessionId)
+        
+        if (success) {
+          console.log(`[${ts()}] [TTS-PLAY] end len=${item.length} session=${sessionId}`)
+        } else {
+          console.log(`[${ts()}] [TTS-PLAY] cancelled len=${item.length} session=${sessionId}`)
+          break // Stop processing queue if cancelled
+        }
       }
     } catch (e) {
       console.log(`[${ts()}] [TTS-PLAY] error ${e.message}`)
@@ -270,39 +357,83 @@ const setupSanPbxWebSocketServer = (ws) => {
     }
   }
 
-  const handleTranscript = async (text) => {
+  // Enhanced transcript handling with incremental processing
+  const handleIncrementalTranscript = async (text, isFinal = false, confidence = 1.0) => {
     try {
       const clean = (text || "").trim()
       if (!clean) return
-      console.log(`[${ts()}] [DEEPGRAM-FINAL] ${clean}`)
-      history.push({ role: "user", content: clean })
+      
+      const wordCount = clean.split(/\s+/).filter(Boolean).length
+      
+      // Cancel any ongoing TTS when user speaks
+      if (!isFinal) {
+        userSpeechDetected = true
+        lastUserInputTime = Date.now()
+        // Cancel current TTS session
+        currentTTSSession++
+        ws.currentTTSSession = currentTTSSession
+        console.log(`[${ts()}] [USER-SPEECH] detected, cancelling TTS session=${currentTTSSession}`)
+      }
+      
+      console.log(`[${ts()}] [TRANSCRIPT-${isFinal ? 'FINAL' : 'INTERIM'}] words=${wordCount} conf=${confidence.toFixed(2)} text="${clean}"`)
+      
+      // Process if final OR if interim meets criteria
+      const shouldProcess = isFinal || 
+                           (wordCount >= LATENCY_CONFIG.INTERIM_MIN_WORDS && 
+                            confidence >= LATENCY_CONFIG.CONFIDENCE_THRESHOLD)
+      
+      if (!shouldProcess) return
+      
+      // Update history only for final transcripts
+      if (isFinal) {
+        history.push({ role: "user", content: clean })
+        userSpeechDetected = false // Reset after final transcript
+      }
+      
+      const sessionId = ++currentLLMSession
       let lastLen = 0
+      
       const shouldFlush = (prev, curr, delta) => {
         const diff = curr.slice(prev)
-        // Safer flushing: min words or punctuation, or larger delta
         const words = diff.trim().split(/\s+/).filter(Boolean).length
-        if ((delta && delta.length >= 30) || words >= 3) return true
+        // More aggressive flushing for lower latency
+        if ((delta && delta.length >= 20) || words >= 2) return true
         return /[.!?]\s?$/.test(curr) || /\n\s*$/.test(curr)
       }
-      const finalText = await respondWithOpenAIStream(clean, history, async (accum, delta) => {
+      
+      const finalText = await respondWithOpenAIStream(clean, history, async (accum, delta, llmSessionId) => {
+        // Skip if this session is outdated
+        if (llmSessionId !== sessionId) return
+        
         if (!accum || accum.length <= lastLen) return
         if (!shouldFlush(lastLen, accum, delta)) return
+        
         const chunk = accum.slice(lastLen).trim()
         lastLen = accum.length
+        
         if (chunk) {
-          console.log(`[${ts()}] [LLM-FLUSH] chunk_len=${chunk.length}`)
+          console.log(`[${ts()}] [LLM-FLUSH] session=${sessionId} chunk_len=${chunk.length}`)
           queueSpeech(chunk, false)
         }
-      })
+      }, sessionId)
+      
+      // Handle final chunk
       if (finalText && finalText.length > lastLen) {
         const tail = finalText.slice(lastLen).trim()
         if (tail) {
-          console.log(`[${ts()}] [LLM-FLUSH] tail_len=${tail.length}`)
+          console.log(`[${ts()}] [LLM-FLUSH] session=${sessionId} tail_len=${tail.length}`)
           queueSpeech(tail, true)
         }
       }
-      if (finalText) history.push({ role: "assistant", content: finalText })
-    } catch (_) {}
+      
+      // Update history only for final transcripts and successful LLM responses
+      if (isFinal && finalText && sessionId === currentLLMSession) {
+        history.push({ role: "assistant", content: finalText })
+      }
+      
+    } catch (e) {
+      console.log(`[${ts()}] [TRANSCRIPT-ERROR] ${e.message}`)
+    }
   }
 
   const bootDeepgram = () => {
@@ -310,8 +441,12 @@ const setupSanPbxWebSocketServer = (ws) => {
     deepgramWs.onopen = () => {
       deepgramReady = true
       console.log(`[${ts()}] 🎤 [DEEPGRAM] open; queued_packets=${dgQueue.length}`)
-      if (dgQueue.length) { dgQueue.forEach((b) => deepgramWs.send(b)); dgQueue = [] }
+      if (dgQueue.length) { 
+        dgQueue.forEach((b) => deepgramWs.send(b))
+        dgQueue = [] 
+      }
     }
+    
     deepgramWs.onmessage = async (evt) => {
       try {
         const msg = JSON.parse(evt.data)
@@ -320,108 +455,108 @@ const setupSanPbxWebSocketServer = (ws) => {
             firstDgMsgTs = Date.now()
             const latFromStart = sttStartTs ? (firstDgMsgTs - sttStartTs) : null
             const latFromFirstForward = firstForwardToDgTs ? (firstDgMsgTs - firstForwardToDgTs) : null
-            console.log(`[${ts()}] [DEEPGRAM-LAT] first_result_ms_from_start=${latFromStart != null ? latFromStart : 'n/a'} from_first_forward_ms=${latFromFirstForward != null ? latFromFirstForward : 'n/a'}`)
+            console.log(`[${ts()}] [DEEPGRAM-LAT] first_result_ms_from_start=${latFromStart || 'n/a'} from_first_forward_ms=${latFromFirstForward || 'n/a'}`)
           }
-          const transcript = msg.channel?.alternatives?.[0]?.transcript || ""
+          
+          const alternative = msg.channel?.alternatives?.[0]
+          const transcript = alternative?.transcript || ""
+          const confidence = alternative?.confidence || 0
+          
           if (transcript) {
-            if (msg.is_final) {
-              // cancel any interim streaming callbacks
-              interimSessionId++
-              if (interimDebounceTimer) { clearTimeout(interimDebounceTimer); interimDebounceTimer = null }
-              interimActive = false
-              await handleTranscript(transcript)
-            } else {
-              console.log(`[${ts()}] [DEEPGRAM-INTERIM] ${transcript}`)
-              // Debounce interim-driven LLM streaming
-              interimPendingText = transcript
-              if (interimDebounceTimer) clearTimeout(interimDebounceTimer)
-              interimDebounceTimer = setTimeout(async () => {
-                // If an interim stream is already active, skip new launch
-                if (interimActive) {
-                  console.log(`[${ts()}] [LLM-INTERIM] skip_launch active=true`)
-                  return
-                }
-                interimActive = true
-                const session = ++interimSessionId
-                const seed = interimPendingText
-                console.log(`[${ts()}] [LLM-INTERIM] launch session=${session} seed_len=${seed.length}`)
-                try {
-                  await respondWithOpenAIStream(seed, history, async (accum, delta) => {
-                    if (interimSessionId !== session) return
-                    if (!delta) return
-                    const out = delta.trim()
-                    if (!out) return
-                    // Route interims into buffered speech aggregator
-                    queueSpeech(out, false)
-                  })
-                } catch (_) {
-                } finally {
-                  if (interimSessionId === session) interimActive = false
-                  console.log(`[${ts()}] [LLM-INTERIM] end session=${session}`)
-                }
-              }, 450)
-            }
+            await handleIncrementalTranscript(transcript, msg.is_final, confidence)
           }
         }
-      } catch (_) {}
+      } catch (e) {
+        console.log(`[${ts()}] [DEEPGRAM-MSG-ERROR] ${e.message}`)
+      }
     }
-    deepgramWs.onerror = (e) => { deepgramReady = false; console.log(`[${ts()}] ❌ [DEEPGRAM] error ${e?.message || ""}`) }
-    deepgramWs.onclose = () => { deepgramReady = false; console.log(`[${ts()}] 🔌 [DEEPGRAM] closed`) }
+    
+    deepgramWs.onerror = (e) => { 
+      deepgramReady = false
+      console.log(`[${ts()}] ⚠ [DEEPGRAM] error ${e?.message || ""}`) 
+    }
+    deepgramWs.onclose = () => { 
+      deepgramReady = false
+      console.log(`[${ts()}] 🔌 [DEEPGRAM] closed`) 
+    }
   }
 
   ws.on("message", async (message) => {
     try {
       const text = Buffer.isBuffer(message) ? message.toString() : String(message)
       const data = JSON.parse(text)
+      
       switch (data.event) {
         case "connected":
           console.log(`[${ts()}] 🔗 [SANPBX] connected`)
           break
+          
         case "start":
           console.log(`[${ts()}] 📞 [SANPBX] start ${JSON.stringify({ streamId: data.streamId, callId: data.callId, channelId: data.channelId })}`)
           ids.streamId = data.streamId
           ids.callId = data.callId
           ids.channelId = data.channelId
           history = []
+          
+          // Reset session counters
+          currentLLMSession = 0
+          currentTTSSession = 0
+          ws.currentTTSSession = 0
+          userSpeechDetected = false
+          
+          // Reset latency markers
           sttStartTs = Date.now()
           firstMediaTs = null
           firstForwardToDgTs = null
           firstDgMsgTs = null
+          
           bootDeepgram()
           await sendGreeting()
           break
+          
         case "media":
           if (data.payload) {
             const audioBuffer = Buffer.from(data.payload, 'base64')
             if (!ws.mediaPacketCount) ws.mediaPacketCount = 0
             ws.mediaPacketCount++
-            if (ws.mediaPacketCount % 1000 === 0) console.log(`[${ts()}] 🎵 [SANPBX-MEDIA] packets=${ws.mediaPacketCount}`)
+            
+            if (ws.mediaPacketCount % 1000 === 0) {
+              console.log(`[${ts()}] 🎵 [SANPBX-MEDIA] packets=${ws.mediaPacketCount}`)
+            }
+            
             if (!firstMediaTs) {
               firstMediaTs = Date.now()
               const latFromStart = sttStartTs ? (firstMediaTs - sttStartTs) : null
-              console.log(`[${ts()}] [STT-LAT] first_media_recv_ms_from_start=${latFromStart != null ? latFromStart : 'n/a'}`)
+              console.log(`[${ts()}] [STT-LAT] first_media_recv_ms_from_start=${latFromStart || 'n/a'}`)
             }
+            
             if (deepgramWs && deepgramReady && deepgramWs.readyState === WebSocket.OPEN) {
               if (!firstForwardToDgTs) {
                 firstForwardToDgTs = Date.now()
                 const latMediaToForward = firstMediaTs ? (firstForwardToDgTs - firstMediaTs) : null
-                console.log(`[${ts()}] [STT-LAT] first_forward_to_deepgram_ms_from_first_media=${latMediaToForward != null ? latMediaToForward : 'n/a'}`)
+                console.log(`[${ts()}] [STT-LAT] first_forward_to_deepgram_ms_from_first_media=${latMediaToForward || 'n/a'}`)
               }
               deepgramWs.send(audioBuffer)
             } else {
               dgQueue.push(audioBuffer)
-              if (dgQueue.length % 100 === 0) console.log(`[${ts()}] ⏳ [DEEPGRAM-QUEUE] queued_packets=${dgQueue.length}`)
+              if (dgQueue.length % 50 === 0) { // Reduced logging frequency
+                console.log(`[${ts()}] ⏳ [DEEPGRAM-QUEUE] queued_packets=${dgQueue.length}`)
+              }
             }
           }
           break
+          
         case "stop":
           console.log(`[${ts()}] 🛑 [SANPBX] stop`)
           if (deepgramWs && deepgramWs.readyState === WebSocket.OPEN) deepgramWs.close()
           break
+          
         default:
           break
       }
-    } catch (_) {}
+    } catch (e) {
+      console.log(`[${ts()}] [SANPBX-MSG-ERROR] ${e.message}`)
+    }
   })
 
   ws.on("close", () => {
@@ -429,7 +564,9 @@ const setupSanPbxWebSocketServer = (ws) => {
     if (deepgramWs && deepgramWs.readyState === WebSocket.OPEN) deepgramWs.close()
   })
 
-  ws.on("error", () => {})
+  ws.on("error", (e) => {
+    console.log(`[${ts()}] [SANPBX-WS-ERROR] ${e.message}`)
+  })
 }
 
 module.exports = { setupSanPbxWebSocketServer }
