@@ -122,7 +122,7 @@ const ttsWithSarvam = async (text) => {
       target_language_code: STATIC.sarvamLanguage,
       speaker: STATIC.sarvamVoice,
       pitch: 0,
-      pace: 0.8, // Slightly faster pace
+      pace: 1.1, // Slightly faster pace
       loudness: 1.0,
       speech_sample_rate: 8000,
       enable_preprocessing: true,
@@ -152,24 +152,26 @@ const respondWithOpenAI = async (userMessage, history = []) => {
   return (data.choices?.[0]?.message?.content || "").trim()
 }
 
-// Optimized OpenAI streaming with faster response triggers
+// Optimized OpenAI streaming with better session management
 const respondWithOpenAIStream = async (userMessage, history = [], onPartial = null, sessionId = null) => {
   const messages = [
     { role: "system", content: STATIC.systemPrompt },
-    ...history.slice(-6),
+    ...history.slice(-4), // Reduced context for faster processing
     { role: "user", content: userMessage },
   ]
   
-  console.log(`[${ts()}] [LLM-STREAM] start session=${sessionId || 'none'}`)
+  console.log(`[${ts()}] [LLM-STREAM] start session=${sessionId || 'none'} message="${userMessage}"`)
+  
   const res = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${API_KEYS.openai}` },
     body: JSON.stringify({ 
       model: "gpt-4o-mini", 
       messages, 
-      max_tokens: 100, 
-      temperature: 0.2,
-      stream: true 
+      max_tokens: 80,    // Reduced for faster responses
+      temperature: 0.1,  // Lower for more consistent responses
+      stream: true,
+      presence_penalty: 0.1  // Slight penalty for repetition
     }),
   })
   
@@ -183,44 +185,53 @@ const respondWithOpenAIStream = async (userMessage, history = [], onPartial = nu
   let buffer = ""
   let accumulated = ""
   let firstTokenLogged = false
+  let tokenCount = 0
   
-  while (true) {
-    const { value, done } = await reader.read()
-    if (done) break
-    
-    buffer += decoder.decode(value, { stream: true })
-    const lines = buffer.split(/\r?\n/)
-    buffer = lines.pop() || ""
-    
-    for (const line of lines) {
-      const trimmed = line.trim()
-      if (!trimmed) continue
-      if (trimmed === "data: [DONE]") {
-        console.log(`[${ts()}] [LLM-STREAM] done_marker session=${sessionId || 'none'}`)
-        break
-      }
-      if (trimmed.startsWith("data:")) {
-        try {
-          const json = JSON.parse(trimmed.slice(5).trim())
-          const delta = json.choices?.[0]?.delta?.content || ""
-          if (delta) {
-            if (!firstTokenLogged) { 
-              firstTokenLogged = true
-              console.log(`[${ts()}] [LLM-STREAM] first_token session=${sessionId || 'none'}`) 
+  try {
+    while (true) {
+      const { value, done } = await reader.read()
+      if (done) break
+      
+      buffer += decoder.decode(value, { stream: true })
+      const lines = buffer.split(/\r?\n/)
+      buffer = lines.pop() || ""
+      
+      for (const line of lines) {
+        const trimmed = line.trim()
+        if (!trimmed) continue
+        if (trimmed === "data: [DONE]") {
+          console.log(`[${ts()}] [LLM-STREAM] done session=${sessionId || 'none'} tokens=${tokenCount}`)
+          break
+        }
+        if (trimmed.startsWith("data:")) {
+          try {
+            const json = JSON.parse(trimmed.slice(5).trim())
+            const delta = json.choices?.[0]?.delta?.content || ""
+            if (delta) {
+              if (!firstTokenLogged) { 
+                firstTokenLogged = true
+                console.log(`[${ts()}] [LLM-STREAM] first_token session=${sessionId || 'none'}`) 
+              }
+              accumulated += delta
+              tokenCount++
+              
+              if (typeof onPartial === "function") {
+                try { 
+                  await onPartial(accumulated, delta, sessionId) 
+                } catch (_) {}
+              }
             }
-            accumulated += delta
-            if (typeof onPartial === "function") {
-              try { 
-                await onPartial(accumulated, delta, sessionId) 
-              } catch (_) {}
-            }
-          }
-        } catch (_) {}
+          } catch (_) {}
+        }
       }
     }
+  } catch (e) {
+    console.log(`[${ts()}] [LLM-STREAM] read_error session=${sessionId} ${e.message}`)
+  } finally {
+    try { reader.releaseLock() } catch (_) {}
   }
   
-  console.log(`[${ts()}] [LLM-STREAM] completed chars=${accumulated.length} session=${sessionId || 'none'}`)
+  console.log(`[${ts()}] [LLM-STREAM] completed session=${sessionId} chars=${accumulated.length} tokens=${tokenCount}`)
   return accumulated || null
 }
 
@@ -300,13 +311,21 @@ const setupSanPbxWebSocketServer = (ws) => {
     speakBuffer = ""
     if (!chunk) return
     
-    if (chunk.length < LATENCY_CONFIG.TTS_MIN_CHARS && reason !== "punct" && reason !== "force") {
-      speakBuffer = chunk
+    // Stricter minimum length to prevent TTS errors
+    if (chunk.length < 5 && reason !== "punct" && reason !== "force") {
+      console.log(`[${ts()}] [TTS-SKIP-FLUSH] too_short="${chunk}" reason=${reason}`)
+      speakBuffer = chunk // Put it back for accumulation
+      return
+    }
+    
+    // Limit TTS queue size to prevent backup
+    if (ttsQueue.length >= 3) {
+      console.log(`[${ts()}] [TTS-QUEUE-LIMIT] dropping chunk="${chunk}" queue_size=${ttsQueue.length}`)
       return
     }
     
     ttsQueue.push(chunk)
-    console.log(`[${ts()}] [TTS-QUEUE] flush(${reason}) len=${chunk.length} queue=${ttsQueue.length}`)
+    console.log(`[${ts()}] [TTS-QUEUE] flush(${reason}) len=${chunk.length} text="${chunk}" queue=${ttsQueue.length}`)
     if (!ttsBusy) processTTSQueue().catch(() => {})
   }
   
@@ -319,51 +338,90 @@ const setupSanPbxWebSocketServer = (ws) => {
       return
     }
     
-    const incoming = text
+    // Filter out very short chunks that cause TTS errors
+    const cleanText = text.trim()
+    if (cleanText.length < 3 && !force) {
+      console.log(`[${ts()}] [TTS-SKIP] too_short="${cleanText}"`)
+      return
+    }
+    
+    // Clear previous buffer if starting fresh
+    const incoming = cleanText
     speakBuffer += (speakBuffer ? " " : "") + incoming
     const bufLen = speakBuffer.length
-    const wordCount = speakBuffer.trim().split(/\s+/).length
+    const wordCount = speakBuffer.trim().split(/\s+/).filter(Boolean).length
     const punctNow = PUNCTUATION_FLUSH.test(speakBuffer)
-    const shouldImmediate = force || punctNow || bufLen >= 60 || wordCount >= 8 // Reduced thresholds
+    
+    // More conservative flushing to prevent breaks
+    const shouldImmediate = force || 
+                           punctNow || 
+                           bufLen >= 80 ||  // Increased threshold
+                           wordCount >= 12  // More words before flushing
     
     if (shouldImmediate) {
-      if (speakDebounceTimer) { clearTimeout(speakDebounceTimer); speakDebounceTimer = null }
+      if (speakDebounceTimer) { 
+        clearTimeout(speakDebounceTimer)
+        speakDebounceTimer = null 
+      }
       flushSpeakBuffer(punctNow ? "punct" : (force ? "force" : "threshold"))
       return
     }
     
+    // Longer debounce to accumulate more text
     if (speakDebounceTimer) clearTimeout(speakDebounceTimer)
-    speakDebounceTimer = setTimeout(() => flushSpeakBuffer("debounce"), LATENCY_CONFIG.TTS_DEBOUNCE_MS)
+    speakDebounceTimer = setTimeout(() => flushSpeakBuffer("debounce"), 300) // Increased from 120ms
   }
   
   const processTTSQueue = async () => {
     if (ttsBusy) return
     ttsBusy = true
+    
     try {
-      while (ttsQueue.length > 0) {
+      while (ttsQueue.length > 0 && ws.readyState === WebSocket.OPEN) {
         const item = ttsQueue.shift()
         const sessionId = ++currentTTSSession
         ws.currentTTSSession = sessionId
         
-        console.log(`[${ts()}] [TTS-PLAY] start len=${item.length} session=${sessionId}`)
-        const pcm = await ttsWithSarvam(item)
-        const success = await streamPcmToSanPBX(ws, ids, pcm, sessionId)
+        console.log(`[${ts()}] [TTS-PLAY] start len=${item.length} session=${sessionId} text="${item}"`)
         
-        if (success) {
-          console.log(`[${ts()}] [TTS-PLAY] end len=${item.length} session=${sessionId}`)
-        } else {
-          console.log(`[${ts()}] [TTS-PLAY] cancelled len=${item.length} session=${sessionId}`)
-          break // Stop processing queue if cancelled
+        try {
+          const pcm = await ttsWithSarvam(item)
+          const success = await streamPcmToSanPBX(ws, ids, pcm, sessionId)
+          
+          if (success) {
+            console.log(`[${ts()}] [TTS-PLAY] success len=${item.length} session=${sessionId}`)
+          } else {
+            console.log(`[${ts()}] [TTS-PLAY] cancelled len=${item.length} session=${sessionId}`)
+            // Clear remaining queue if cancelled
+            ttsQueue = []
+            break
+          }
+        } catch (e) {
+          console.log(`[${ts()}] [TTS-PLAY] error len=${item.length} session=${sessionId} error="${e.message}"`)
+          
+          // Skip problematic short texts but continue with queue
+          if (e.message.includes('400') && item.length < 5) {
+            console.log(`[${ts()}] [TTS-PLAY] skipping short text="${item}"`)
+            continue
+          } else {
+            // For other errors, stop processing
+            break
+          }
         }
       }
     } catch (e) {
-      console.log(`[${ts()}] [TTS-PLAY] error ${e.message}`)
+      console.log(`[${ts()}] [TTS-QUEUE-ERROR] ${e.message}`)
     } finally {
       ttsBusy = false
+      
+      // Process any remaining items that were added during processing
+      if (ttsQueue.length > 0 && ws.readyState === WebSocket.OPEN) {
+        setTimeout(() => processTTSQueue(), 100)
+      }
     }
   }
 
-  // Enhanced transcript handling with incremental processing
+  // Enhanced transcript handling with better session management
   const handleIncrementalTranscript = async (text, isFinal = false, confidence = 1.0) => {
     try {
       const clean = (text || "").trim()
@@ -371,22 +429,35 @@ const setupSanPbxWebSocketServer = (ws) => {
       
       const wordCount = clean.split(/\s+/).filter(Boolean).length
       
-      // Cancel any ongoing TTS when user speaks
+      // Cancel any ongoing operations when user speaks
       if (!isFinal) {
         userSpeechDetected = true
         lastUserInputTime = Date.now()
-        // Cancel current TTS session
-        currentTTSSession++
+        
+        // Cancel current TTS and LLM sessions aggressively
+        const oldTTSSession = currentTTSSession
+        const oldLLMSession = currentLLMSession
+        currentTTSSession += 2  // Skip ahead to ensure cancellation
+        currentLLMSession += 2
         ws.currentTTSSession = currentTTSSession
-        console.log(`[${ts()}] [USER-SPEECH] detected, cancelling TTS session=${currentTTSSession}`)
+        
+        // Clear TTS queue to prevent backup
+        ttsQueue = []
+        ttsBusy = false
+        if (speakDebounceTimer) {
+          clearTimeout(speakDebounceTimer)
+          speakDebounceTimer = null
+        }
+        speakBuffer = ""
+        
+        console.log(`[${ts()}] [USER-SPEECH] detected, cancelling TTS=${oldTTSSession}→${currentTTSSession} LLM=${oldLLMSession}→${currentLLMSession}`)
       }
       
       console.log(`[${ts()}] [TRANSCRIPT-${isFinal ? 'FINAL' : 'INTERIM'}] words=${wordCount} conf=${confidence.toFixed(2)} text="${clean}"`)
       
-      // Process if final OR if interim meets criteria
+      // Only process final transcripts OR high-quality long interim transcripts
       const shouldProcess = isFinal || 
-                           (wordCount >= LATENCY_CONFIG.INTERIM_MIN_WORDS && 
-                            confidence >= LATENCY_CONFIG.CONFIDENCE_THRESHOLD)
+                           (wordCount >= 4 && confidence >= 0.8 && !isFinal) // More selective interim processing
       
       if (!shouldProcess) return
       
@@ -398,36 +469,43 @@ const setupSanPbxWebSocketServer = (ws) => {
       
       const sessionId = ++currentLLMSession
       let lastLen = 0
+      let responseText = ""
       
-      const shouldFlush = (prev, curr, delta) => {
-        const diff = curr.slice(prev)
-        const words = diff.trim().split(/\s+/).filter(Boolean).length
-        // More aggressive flushing for lower latency
-        if ((delta && delta.length >= 20) || words >= 2) return true
-        return /[.!?]\s?$/.test(curr) || /\n\s*$/.test(curr)
+      // Less aggressive flushing to prevent sentence breaks
+      const shouldFlush = (prev, curr) => {
+        const diff = curr.slice(prev).trim()
+        const words = diff.split(/\s+/).filter(Boolean).length
+        
+        // Only flush on natural breakpoints
+        if (words >= 8) return true // Longer chunks
+        if (/[.!?]\s*$/.test(diff)) return true // Sentence endings
+        if (diff.length >= 50) return true // Long chunks
+        
+        return false
       }
       
       const finalText = await respondWithOpenAIStream(clean, history, async (accum, delta, llmSessionId) => {
         // Skip if this session is outdated
         if (llmSessionId !== sessionId) return
         
+        responseText = accum
+        
         if (!accum || accum.length <= lastLen) return
-        if (!shouldFlush(lastLen, accum, delta)) return
+        if (!shouldFlush(lastLen, accum)) return
         
         const chunk = accum.slice(lastLen).trim()
-        lastLen = accum.length
+        if (!chunk) return
         
-        if (chunk) {
-          console.log(`[${ts()}] [LLM-FLUSH] session=${sessionId} chunk_len=${chunk.length}`)
-          queueSpeech(chunk, false)
-        }
+        lastLen = accum.length
+        console.log(`[${ts()}] [LLM-FLUSH] session=${sessionId} chunk_len=${chunk.length} chunk="${chunk}"`)
+        queueSpeech(chunk, false)
       }, sessionId)
       
-      // Handle final chunk
+      // Handle final chunk - ensure we speak the complete response
       if (finalText && finalText.length > lastLen) {
         const tail = finalText.slice(lastLen).trim()
         if (tail) {
-          console.log(`[${ts()}] [LLM-FLUSH] session=${sessionId} tail_len=${tail.length}`)
+          console.log(`[${ts()}] [LLM-FINAL] session=${sessionId} tail_len=${tail.length} tail="${tail}"`)
           queueSpeech(tail, true)
         }
       }
@@ -435,6 +513,7 @@ const setupSanPbxWebSocketServer = (ws) => {
       // Update history only for final transcripts and successful LLM responses
       if (isFinal && finalText && sessionId === currentLLMSession) {
         history.push({ role: "assistant", content: finalText })
+        console.log(`[${ts()}] [HISTORY-UPDATE] session=${sessionId} response_len=${finalText.length}`)
       }
       
     } catch (e) {
