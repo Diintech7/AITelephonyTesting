@@ -122,7 +122,7 @@ const ttsWithSarvam = async (text) => {
       target_language_code: STATIC.sarvamLanguage,
       speaker: STATIC.sarvamVoice,
       pitch: 0,
-      pace: 1.1, // Slightly faster pace
+      pace: 0.8, // Slightly faster pace
       loudness: 1.0,
       speech_sample_rate: 8000,
       enable_preprocessing: true,
