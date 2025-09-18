@@ -225,22 +225,28 @@ const respondWithOpenAIStream = async (userMessage, history = [], onPartial = nu
 }
 
 const connectDeepgram = (language = STATIC.deepgramLanguage) => {
+  // Use the most basic, reliable configuration first
   const url = new URL("wss://api.deepgram.com/v1/listen")
   url.searchParams.append("sample_rate", "44100")
-  url.searchParams.append("channels", "1")
+  url.searchParams.append("channels", "1") 
   url.searchParams.append("encoding", "linear16")
-  url.searchParams.append("model", "nova-2")
   url.searchParams.append("language", language)
   url.searchParams.append("interim_results", "true")
+  
+  // Only add parameters that are definitely supported
+  url.searchParams.append("model", "nova-2")
   url.searchParams.append("smart_format", "true")
   url.searchParams.append("punctuate", "true")
-  // Optimize for low latency
-  url.searchParams.append("endpointing", "100") // Faster endpoint detection
-  url.searchParams.append("utterance_end_ms", "800") // Reduced from default
   
   const wsUrl = url.toString()
   console.log(`[${ts()}] [DEEPGRAM-CONNECT] ${wsUrl}`)
-  return new WebSocket(wsUrl, { headers: { Authorization: `Token ${API_KEYS.deepgram}` } })
+  console.log(`[${ts()}] [DEEPGRAM-AUTH] Using API key: ${API_KEYS.deepgram ? `${API_KEYS.deepgram.substring(0, 8)}...` : 'MISSING'}`)
+  
+  return new WebSocket(wsUrl, { 
+    headers: { 
+      Authorization: `Token ${API_KEYS.deepgram}` 
+    } 
+  })
 }
 
 const setupSanPbxWebSocketServer = (ws) => {
@@ -436,13 +442,26 @@ const setupSanPbxWebSocketServer = (ws) => {
     }
   }
 
-  const bootDeepgram = () => {
+  const bootDeepgram = (retryCount = 0) => {
+    const MAX_RETRIES = 3
+    const RETRY_DELAY = 1000 * Math.pow(2, retryCount) // Exponential backoff
+    
+    console.log(`[${ts()}] [DEEPGRAM-BOOT] attempt=${retryCount + 1}/${MAX_RETRIES + 1}`)
+    
     deepgramWs = connectDeepgram()
+    
     deepgramWs.onopen = () => {
       deepgramReady = true
-      console.log(`[${ts()}] 🎤 [DEEPGRAM] open; queued_packets=${dgQueue.length}`)
+      console.log(`[${ts()}] 🎤 [DEEPGRAM] connected successfully; queued_packets=${dgQueue.length}`)
+      
+      // Send queued audio packets
       if (dgQueue.length) { 
-        dgQueue.forEach((b) => deepgramWs.send(b))
+        console.log(`[${ts()}] [DEEPGRAM] sending ${dgQueue.length} queued packets`)
+        dgQueue.forEach((b) => {
+          if (deepgramWs.readyState === WebSocket.OPEN) {
+            deepgramWs.send(b)
+          }
+        })
         dgQueue = [] 
       }
     }
@@ -465,6 +484,8 @@ const setupSanPbxWebSocketServer = (ws) => {
           if (transcript) {
             await handleIncrementalTranscript(transcript, msg.is_final, confidence)
           }
+        } else if (msg.type === "Metadata") {
+          console.log(`[${ts()}] [DEEPGRAM-META] ${JSON.stringify(msg)}`)
         }
       } catch (e) {
         console.log(`[${ts()}] [DEEPGRAM-MSG-ERROR] ${e.message}`)
@@ -473,11 +494,23 @@ const setupSanPbxWebSocketServer = (ws) => {
     
     deepgramWs.onerror = (e) => { 
       deepgramReady = false
-      console.log(`[${ts()}] ⚠ [DEEPGRAM] error ${e?.message || ""}`) 
+      console.log(`[${ts()}] ⚠ [DEEPGRAM] error: ${e?.message || e?.type || 'unknown'}`) 
+      console.log(`[${ts()}] [DEEPGRAM] error details:`, e)
     }
-    deepgramWs.onclose = () => { 
+    
+    deepgramWs.onclose = (e) => { 
       deepgramReady = false
-      console.log(`[${ts()}] 🔌 [DEEPGRAM] closed`) 
+      console.log(`[${ts()}] 🔌 [DEEPGRAM] closed code=${e?.code} reason="${e?.reason || 'none'}"`)
+      
+      // Retry connection if it was not a normal close and we have retries left
+      if (e?.code !== 1000 && retryCount < MAX_RETRIES && ids.streamId) {
+        console.log(`[${ts()}] [DEEPGRAM-RETRY] retrying in ${RETRY_DELAY}ms...`)
+        setTimeout(() => {
+          bootDeepgram(retryCount + 1)
+        }, RETRY_DELAY)
+      } else if (e?.code !== 1000) {
+        console.log(`[${ts()}] [DEEPGRAM-FAILED] max retries exceeded or call ended`)
+      }
     }
   }
 
