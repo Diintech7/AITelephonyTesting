@@ -156,12 +156,13 @@ const streamPcmToSanPBX = async (ws, { streamId, callId, channelId }, pcmBase64,
   return true
 }
 
-// ElevenLabs WebSocket TTS streaming
+// ElevenLabs WebSocket TTS streaming (optimized for 8kHz PCM output)
 const elevenLabsStreamTTS = async (text, ws, ids, sessionId) => {
   return new Promise(async (resolve) => {
     try {
       if (!API_KEYS.elevenlabs) throw new Error("Missing ELEVEN_API_KEY")
-      const url = `wss://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(ELEVEN_CONFIG.voiceId)}/stream-input?model_id=${encodeURIComponent(ELEVEN_CONFIG.modelId)}&inactivity_timeout=${ELEVEN_CONFIG.inactivityTimeout}&voice_settings=true&optimize_streaming_latency=2`
+      // Request PCM 8k directly to avoid resampling
+      const url = `wss://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(ELEVEN_CONFIG.voiceId)}/stream-input?model_id=${encodeURIComponent(ELEVEN_CONFIG.modelId)}&inactivity_timeout=${ELEVEN_CONFIG.inactivityTimeout}&output_format=pcm_8000&optimize_streaming_latency=3`
       const headers = { 'xi-api-key': API_KEYS.elevenlabs }
       const elWs = new WebSocket(url, { headers })
 
@@ -175,13 +176,13 @@ const elevenLabsStreamTTS = async (text, ws, ids, sessionId) => {
       elWs.on("open", () => {
         opened = true
         console.log(`[${ts()}] [11L-WS] open session=${sessionId}`)
-        // Initialize connection
+        // Initialize connection (request 8k PCM)
         const initMsg = {
           event: "initialize",
           text: "",
           voice_settings: { stability: 0.3, similarity_boost: 0.7, style: 0.3 },
           generation_config: { chunk_length_schedule: [120, 200] },
-          audio_format: "pcm_16000",
+          audio_format: "pcm_8000",
           modalities: ["audio"],
           xi_api_key: API_KEYS.elevenlabs,
         }
@@ -210,16 +211,12 @@ const elevenLabsStreamTTS = async (text, ws, ids, sessionId) => {
           // Messages can be binary audio or JSON. For simplicity, detect JSON first
           let asText = null
           if (Buffer.isBuffer(data)) {
-            // Binary path: treat as raw PCM16k mono
-            const pcm16kBuf = data
+            // Binary path: treat as raw PCM8k mono (already 8k from ElevenLabs)
+            const pcm8kBuf = data
             if (!firstAudioAt) firstAudioAt = Date.now()
-            const base64Audio = pcm16kBuf.toString('base64')
-            const resampleStart = Date.now()
-            const down = downsamplePcm16kTo8kBase64(base64Audio)
-            const resampleMs = Date.now() - resampleStart
-            console.log(`[${ts()}] [11L-AUDIO-BIN] bytes=${pcm16kBuf.length} resample_ms=${resampleMs}`)
-            // Accumulate until we have enough for multiple 20ms frames
-            pcm8kAcc = Buffer.concat([pcm8kAcc, Buffer.from(down, 'base64')])
+            console.log(`[${ts()}] [11L-AUDIO-BIN] bytes=${pcm8kBuf.length} (8kHz)`)
+            // Accumulate until we have enough for multiple 20ms frames (320 bytes @ 8kHz)
+            pcm8kAcc = Buffer.concat([pcm8kAcc, pcm8kBuf])
             if (pcm8kAcc.length >= FRAME_BYTES * 5) { // ~100ms
               const fullFrames = Math.floor(pcm8kAcc.length / FRAME_BYTES)
               const sendLen = fullFrames * FRAME_BYTES
@@ -235,24 +232,14 @@ const elevenLabsStreamTTS = async (text, ws, ids, sessionId) => {
           try {
             const msg = JSON.parse(asText)
             if (msg?.audio) {
-              // audio is base64 at model sample rate (usually 16000)
+              // audio is base64 PCM at 8000 Hz (requested)
               const base64Audio = msg.audio
-              const pcm16kBuf = Buffer.from(base64Audio, 'base64')
-              const sampleCount = Math.floor(pcm16kBuf.length / 2)
-              // Preview first up to 20 samples as signed 16-bit LE
-              const previewCount = Math.min(20, sampleCount)
-              const preview = []
-              for (let i = 0; i < previewCount; i++) {
-                preview.push(pcm16kBuf.readInt16LE(i * 2))
-              }
+              const pcm8kBuf = Buffer.from(base64Audio, 'base64')
+              const sampleCount = Math.floor(pcm8kBuf.length / 2)
               if (!firstAudioAt) firstAudioAt = Date.now()
-              console.log(`[${ts()}] [11L-AUDIO-PCM16] sr=16000Hz ch=1 bytes=${pcm16kBuf.length} samples=${sampleCount} preview=${JSON.stringify(preview)}`)
-
-              const resampleStart = Date.now()
-              const down = downsamplePcm16kTo8kBase64(base64Audio)
-              const resampleMs = Date.now() - resampleStart
-              console.log(`[${ts()}] [11L-AUDIO] chunk_received base64_len=${base64Audio.length} resample_ms=${resampleMs}`)
-              pcm8kAcc = Buffer.concat([pcm8kAcc, Buffer.from(down, 'base64')])
+              console.log(`[${ts()}] [11L-AUDIO-PCM16] sr=8000Hz ch=1 bytes=${pcm8kBuf.length} samples=${sampleCount}`)
+              // Directly accumulate 8k audio
+              pcm8kAcc = Buffer.concat([pcm8kAcc, pcm8kBuf])
               if (pcm8kAcc.length >= FRAME_BYTES * 5) {
                 const fullFrames = Math.floor(pcm8kAcc.length / FRAME_BYTES)
                 const sendLen = fullFrames * FRAME_BYTES
