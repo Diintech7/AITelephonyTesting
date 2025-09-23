@@ -31,7 +31,7 @@ const STATIC = {
 
 // ElevenLabs configuration (voice and model)
 const ELEVEN_CONFIG = {
-  voiceId: process.env.ELEVEN_VOICE_ID || "21m00Tcm4TlvDq8ikWAM", // default example voice id
+  voiceId: process.env.ELEVEN_VOICE_ID || "Xb7hH8MSUJpSbSDYk0k2", // default example voice id
   modelId: process.env.ELEVEN_MODEL_ID || "eleven_flash_v2_5",
   inactivityTimeout: 180, // seconds
 }
