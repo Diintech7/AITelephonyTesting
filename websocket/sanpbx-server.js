@@ -101,6 +101,7 @@ const downsamplePcm16kTo8kBase64 = (pcm16kBase64) => {
     return res
   } catch (e) {
     console.log(`[${ts()}] [RESAMPLE] error ${e.message}`)
+    console.log(pcm16kBase64)
     return pcm16kBase64
   }
 }
