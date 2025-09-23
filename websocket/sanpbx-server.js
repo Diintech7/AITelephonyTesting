@@ -184,15 +184,13 @@ const elevenLabsStreamTTS = async (text, ws, ids, sessionId) => {
       elWs.on("open", () => {
         opened = true
         console.log(`[${ts()}] [11L-WS] open session=${sessionId}`)
-        // Initialize connection (request 8k PCM)
+        // Initialize connection (output format controlled via URL)
         const initMsg = {
           event: "initialize",
           text: "",
           voice_settings: { stability: 0.3, similarity_boost: 0.7, style: 0.3 },
           generation_config: { chunk_length_schedule: [120, 200] },
-          audio_format: "pcm_8000",
           modalities: ["audio"],
-          xi_api_key: API_KEYS.elevenlabs,
         }
         try { elWs.send(JSON.stringify(initMsg)) } catch (_) {}
         // Send the text
@@ -208,6 +206,7 @@ const elevenLabsStreamTTS = async (text, ws, ids, sessionId) => {
       let firstAudioAt = null
       let pcm8kAcc = Buffer.alloc(0)
       const FRAME_BYTES = 320 // 20ms @ 8kHz mono 16-bit
+      let sentBytes = 0
       let audioWatch = setTimeout(() => {
         if (!firstAudioAt) {
           console.log(`[${ts()}] [11L-WS] no_audio_yet 1500ms after open session=${sessionId}`)
@@ -237,6 +236,7 @@ const elevenLabsStreamTTS = async (text, ws, ids, sessionId) => {
                 const toSend = pcm8kAcc.slice(0, sendLen)
                 const remainder = pcm8kAcc.slice(sendLen)
                 pcm8kAcc = remainder
+                sentBytes += toSend.length
                 await streamPcmToSanPBX(ws, ids, toSend.toString('base64'), sessionId)
               }
               return
@@ -271,6 +271,7 @@ const elevenLabsStreamTTS = async (text, ws, ids, sessionId) => {
                 const toSend = pcm8kAcc.slice(0, sendLen)
                 const remainder = pcm8kAcc.slice(sendLen)
                 pcm8kAcc = remainder
+                sentBytes += toSend.length
                 await streamPcmToSanPBX(ws, ids, toSend.toString('base64'), sessionId)
               }
             } else if (msg?.isFinal) {
@@ -311,11 +312,17 @@ const elevenLabsStreamTTS = async (text, ws, ids, sessionId) => {
               // pad to one frame
               toSendBuf = Buffer.concat([pcm8kAcc, Buffer.alloc(FRAME_BYTES - pcm8kAcc.length)])
             }
+            sentBytes += toSendBuf.length
             await streamPcmToSanPBX(ws, ids, toSendBuf.toString('base64'), sessionId)
           }
         } catch (_) {}
         if (keepAlive) { clearInterval(keepAlive); keepAlive = null }
-        safeResolve(true)
+        if (sentBytes <= 0) {
+          console.log(`[${ts()}] [11L-NO-AUDIO] session=${sessionId} no_bytes_sent`)
+          safeResolve(false)
+        } else {
+          safeResolve(true)
+        }
       })
 
       // Safety timeout
