@@ -83,18 +83,21 @@ const downsamplePcm16kTo8kBase64 = (pcm16kBase64) => {
   const start = Date.now()
   try {
     const src = Buffer.from(pcm16kBase64, 'base64')
-    if (src.length % 2 !== 0) return pcm16kBase64
+    const samples = Math.floor(src.length / 2)
+    if (samples <= 0) return pcm16kBase64
     const dst = Buffer.alloc(Math.floor(src.length / 2))
     // Copy every other 16-bit sample (little-endian)
     let di = 0
-    for (let i = 0; i + 1 < src.length; i += 4) {
-      // take first sample of the pair
-      dst[di++] = src[i]
-      if (di < dst.length) dst[di++] = src[i + 1]
+    for (let si = 0; si < samples; si += 2) {
+      const byteIndex = si * 2
+      if (byteIndex + 1 < src.length && di + 1 < dst.length) {
+        dst[di++] = src[byteIndex]
+        dst[di++] = src[byteIndex + 1]
+      }
     }
     const res = dst.toString('base64')
     const ms = Date.now() - start
-    console.log(`[${ts()}] [RESAMPLE] from_16k_to_8k_ms=${ms}`)
+    console.log(`[${ts()}] [RESAMPLE] from_16k_to_8k_ms=${ms} in_bytes=${src.length} out_bytes=${dst.length}`)
     return res
   } catch (e) {
     console.log(`[${ts()}] [RESAMPLE] error ${e.message}`)
@@ -108,6 +111,9 @@ const streamPcmToSanPBX = async (ws, { streamId, callId, channelId }, pcmBase64,
   
   const CHUNK_SIZE = 320
   const audioBuffer = Buffer.from(pcmBase64, 'base64')
+  const totalBytes = audioBuffer.length
+  const totalChunks = Math.ceil(totalBytes / CHUNK_SIZE)
+  console.log(`[${ts()}] [SIP-AUDIO-START] session=${sessionId || 'n/a'} format=PCM16 mono sample_rate=8000Hz chunk_bytes=${CHUNK_SIZE} total_bytes=${totalBytes} total_chunks=${totalChunks}`)
   let position = 0
   
   while (position < audioBuffer.length && ws.readyState === WebSocket.OPEN) {
@@ -129,6 +135,9 @@ const streamPcmToSanPBX = async (ws, { streamId, callId, channelId }, pcmBase64,
     
     position += CHUNK_SIZE
     if (position < audioBuffer.length) await new Promise(r => setTimeout(r, 20))
+    if ((position / CHUNK_SIZE) % 50 === 0) {
+      console.log(`[${ts()}] [SIP-AUDIO] sent_chunks=${Math.min(Math.ceil(position/CHUNK_SIZE), totalChunks)}/${totalChunks}`)
+    }
   }
   
   // Send silence frames only if session is still valid
@@ -142,6 +151,7 @@ const streamPcmToSanPBX = async (ws, { streamId, callId, channelId }, pcmBase64,
     } catch (_) {}
   }
   
+  console.log(`[${ts()}] [SIP-AUDIO-END] session=${sessionId || 'n/a'} total_bytes=${totalBytes} total_chunks=${totalChunks}`)
   return true
 }
 
@@ -191,7 +201,10 @@ const elevenLabsStreamTTS = async (text, ws, ids, sessionId) => {
             const msg = JSON.parse(asText)
             if (msg?.audio) {
               // audio is base64 at model sample rate (usually 16000)
+              const resampleStart = Date.now()
               const down = downsamplePcm16kTo8kBase64(msg.audio)
+              const resampleMs = Date.now() - resampleStart
+              console.log(`[${ts()}] [11L-AUDIO] chunk_received len=${msg.audio.length}B resample_ms=${resampleMs}`)
               await streamPcmToSanPBX(ws, ids, down, sessionId)
             } else if (msg?.isFinal) {
               console.log(`[${ts()}] [11L-WS] final session=${sessionId}`)
