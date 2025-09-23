@@ -197,6 +197,8 @@ const elevenLabsStreamTTS = async (text, ws, ids, sessionId) => {
       })
 
       let firstAudioAt = null
+      let pcm8kAcc = Buffer.alloc(0)
+      const FRAME_BYTES = 320 // 20ms @ 8kHz mono 16-bit
       let audioWatch = setTimeout(() => {
         if (!firstAudioAt) {
           console.log(`[${ts()}] [11L-WS] no_audio_yet 1500ms after open session=${sessionId}`)
@@ -216,7 +218,16 @@ const elevenLabsStreamTTS = async (text, ws, ids, sessionId) => {
             const down = downsamplePcm16kTo8kBase64(base64Audio)
             const resampleMs = Date.now() - resampleStart
             console.log(`[${ts()}] [11L-AUDIO-BIN] bytes=${pcm16kBuf.length} resample_ms=${resampleMs}`)
-            await streamPcmToSanPBX(ws, ids, down, sessionId)
+            // Accumulate until we have enough for multiple 20ms frames
+            pcm8kAcc = Buffer.concat([pcm8kAcc, Buffer.from(down, 'base64')])
+            if (pcm8kAcc.length >= FRAME_BYTES * 5) { // ~100ms
+              const fullFrames = Math.floor(pcm8kAcc.length / FRAME_BYTES)
+              const sendLen = fullFrames * FRAME_BYTES
+              const toSend = pcm8kAcc.slice(0, sendLen)
+              const remainder = pcm8kAcc.slice(sendLen)
+              pcm8kAcc = remainder
+              await streamPcmToSanPBX(ws, ids, toSend.toString('base64'), sessionId)
+            }
             return
           } else {
             asText = String(data)
@@ -241,7 +252,15 @@ const elevenLabsStreamTTS = async (text, ws, ids, sessionId) => {
               const down = downsamplePcm16kTo8kBase64(base64Audio)
               const resampleMs = Date.now() - resampleStart
               console.log(`[${ts()}] [11L-AUDIO] chunk_received base64_len=${base64Audio.length} resample_ms=${resampleMs}`)
-              await streamPcmToSanPBX(ws, ids, down, sessionId)
+              pcm8kAcc = Buffer.concat([pcm8kAcc, Buffer.from(down, 'base64')])
+              if (pcm8kAcc.length >= FRAME_BYTES * 5) {
+                const fullFrames = Math.floor(pcm8kAcc.length / FRAME_BYTES)
+                const sendLen = fullFrames * FRAME_BYTES
+                const toSend = pcm8kAcc.slice(0, sendLen)
+                const remainder = pcm8kAcc.slice(sendLen)
+                pcm8kAcc = remainder
+                await streamPcmToSanPBX(ws, ids, toSend.toString('base64'), sessionId)
+              }
             } else if (msg?.isFinal) {
               console.log(`[${ts()}] [11L-WS] final session=${sessionId}`)
             }
@@ -264,8 +283,23 @@ const elevenLabsStreamTTS = async (text, ws, ids, sessionId) => {
           })
         } catch (_) {}
       })
-      elWs.on("close", () => {
+      elWs.on("close", async () => {
         console.log(`[${ts()}] [11L-WS] close session=${sessionId}`)
+        // Flush any remaining audio (pad to one frame)
+        try {
+          if (pcm8kAcc.length > 0) {
+            const fullFrames = Math.floor(pcm8kAcc.length / FRAME_BYTES)
+            let toSendBuf
+            if (fullFrames >= 1) {
+              const sendLen = fullFrames * FRAME_BYTES
+              toSendBuf = pcm8kAcc.slice(0, sendLen)
+            } else {
+              // pad to one frame
+              toSendBuf = Buffer.concat([pcm8kAcc, Buffer.alloc(FRAME_BYTES - pcm8kAcc.length)])
+            }
+            await streamPcmToSanPBX(ws, ids, toSendBuf.toString('base64'), sessionId)
+          }
+        } catch (_) {}
         if (keepAlive) { clearInterval(keepAlive); keepAlive = null }
         safeResolve(true)
       })
