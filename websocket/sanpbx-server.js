@@ -164,38 +164,60 @@ const elevenLabsStreamTTS = async (text, ws, ids, sessionId) => {
       const url = `wss://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(ELEVEN_CONFIG.voiceId)}/stream-input?model_id=${encodeURIComponent(ELEVEN_CONFIG.modelId)}&inactivity_timeout=${ELEVEN_CONFIG.inactivityTimeout}&voice_settings=true&optimize_streaming_latency=2`
       const headers = { 'xi-api-key': API_KEYS.elevenlabs }
       const elWs = new WebSocket(url, { headers })
-      console.log(elWs)
 
       let opened = false
       let resolved = false
 
       const safeResolve = (ok) => { if (!resolved) { resolved = true; try { elWs.close() } catch (_) {}; resolve(ok) } }
 
+      let keepAlive = null
+
       elWs.on("open", () => {
         opened = true
         console.log(`[${ts()}] [11L-WS] open session=${sessionId}`)
         // Initialize connection
         const initMsg = {
-          text: "", // initialize
+          event: "initialize",
+          text: "",
           voice_settings: { stability: 0.3, similarity_boost: 0.7, style: 0.3 },
           generation_config: { chunk_length_schedule: [120, 200] },
+          audio_format: "pcm_16000",
+          modalities: ["audio"],
           xi_api_key: API_KEYS.elevenlabs,
         }
-        try { elWs.send(JSON.stringify({ ...initMsg, event: "initialize" })) } catch (_) {}
+        try { elWs.send(JSON.stringify(initMsg)) } catch (_) {}
         // Send the text
         try { elWs.send(JSON.stringify({ event: "input_text", text })) } catch (_) {}
         // Flush to force generation
         try { elWs.send(JSON.stringify({ event: "flush" })) } catch (_) {}
+        // Keep alive (space) every 10s
+        keepAlive = setInterval(() => {
+          try { elWs.send(" ") } catch (_) {}
+        }, 10000)
       })
+
+      let firstAudioAt = null
+      let audioWatch = setTimeout(() => {
+        if (!firstAudioAt) {
+          console.log(`[${ts()}] [11L-WS] no_audio_yet 1500ms after open session=${sessionId}`)
+        }
+      }, 1500)
 
       elWs.on("message", async (data) => {
         try {
           // Messages can be binary audio or JSON. For simplicity, detect JSON first
           let asText = null
           if (Buffer.isBuffer(data)) {
-            // Assume PCM16 mono 16k if provided as raw; otherwise audio chunk base64 in JSON
-            // ElevenLabs WS typically returns JSON chunks with audio base64
-            asText = data.toString()
+            // Binary path: treat as raw PCM16k mono
+            const pcm16kBuf = data
+            if (!firstAudioAt) firstAudioAt = Date.now()
+            const base64Audio = pcm16kBuf.toString('base64')
+            const resampleStart = Date.now()
+            const down = downsamplePcm16kTo8kBase64(base64Audio)
+            const resampleMs = Date.now() - resampleStart
+            console.log(`[${ts()}] [11L-AUDIO-BIN] bytes=${pcm16kBuf.length} resample_ms=${resampleMs}`)
+            await streamPcmToSanPBX(ws, ids, down, sessionId)
+            return
           } else {
             asText = String(data)
           }
@@ -212,6 +234,7 @@ const elevenLabsStreamTTS = async (text, ws, ids, sessionId) => {
               for (let i = 0; i < previewCount; i++) {
                 preview.push(pcm16kBuf.readInt16LE(i * 2))
               }
+              if (!firstAudioAt) firstAudioAt = Date.now()
               console.log(`[${ts()}] [11L-AUDIO-PCM16] sr=16000Hz ch=1 bytes=${pcm16kBuf.length} samples=${sampleCount} preview=${JSON.stringify(preview)}`)
 
               const resampleStart = Date.now()
@@ -232,8 +255,18 @@ const elevenLabsStreamTTS = async (text, ws, ids, sessionId) => {
         console.log(`[${ts()}] [11L-WS] error ${e?.message || ''}`)
         safeResolve(false)
       })
+      elWs.on("unexpected-response", (req, res) => {
+        try {
+          let body = ""
+          res.on('data', (c) => body += c.toString())
+          res.on('end', () => {
+            console.log(`[${ts()}] [11L-WS] unexpected_response status=${res.statusCode} headers=${JSON.stringify(res.headers)} body=${body.slice(0,300)}...`)
+          })
+        } catch (_) {}
+      })
       elWs.on("close", () => {
         console.log(`[${ts()}] [11L-WS] close session=${sessionId}`)
+        if (keepAlive) { clearInterval(keepAlive); keepAlive = null }
         safeResolve(true)
       })
 
