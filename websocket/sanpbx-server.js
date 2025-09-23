@@ -7,6 +7,7 @@ const API_KEYS = {
   deepgram: process.env.DEEPGRAM_API_KEY,
   sarvam: process.env.SARVAM_API_KEY,
   openai: process.env.OPENAI_API_KEY,
+  elevenlabs: process.env.ELEVEN_API_KEY,
 }
 
 if (!API_KEYS.deepgram || !API_KEYS.sarvam || !API_KEYS.openai) {
@@ -26,6 +27,13 @@ const STATIC = {
     "End with a short, relevant follow-up question.",
   ].join(" "),
   firstMessage: "Hello! How can I help you today?",
+}
+
+// ElevenLabs configuration (voice and model)
+const ELEVEN_CONFIG = {
+  voiceId: process.env.ELEVEN_VOICE_ID || "21m00Tcm4TlvDq8ikWAM", // default example voice id
+  modelId: process.env.ELEVEN_MODEL_ID || "eleven_flash_v2_5",
+  inactivityTimeout: 180, // seconds
 }
 
 // Latency optimization constants
@@ -67,6 +75,30 @@ const extractPcmLinear16Mono8kBase64 = (audioBase64) => {
     return audioBase64
   } catch (_) {
     return audioBase64
+  }
+}
+
+// Downsample raw PCM 16-bit mono from 16kHz to 8kHz by simple decimation (every 2nd sample)
+const downsamplePcm16kTo8kBase64 = (pcm16kBase64) => {
+  const start = Date.now()
+  try {
+    const src = Buffer.from(pcm16kBase64, 'base64')
+    if (src.length % 2 !== 0) return pcm16kBase64
+    const dst = Buffer.alloc(Math.floor(src.length / 2))
+    // Copy every other 16-bit sample (little-endian)
+    let di = 0
+    for (let i = 0; i + 1 < src.length; i += 4) {
+      // take first sample of the pair
+      dst[di++] = src[i]
+      if (di < dst.length) dst[di++] = src[i + 1]
+    }
+    const res = dst.toString('base64')
+    const ms = Date.now() - start
+    console.log(`[${ts()}] [RESAMPLE] from_16k_to_8k_ms=${ms}`)
+    return res
+  } catch (e) {
+    console.log(`[${ts()}] [RESAMPLE] error ${e.message}`)
+    return pcm16kBase64
   }
 }
 
@@ -113,27 +145,84 @@ const streamPcmToSanPBX = async (ws, { streamId, callId, channelId }, pcmBase64,
   return true
 }
 
-const ttsWithSarvam = async (text) => {
-  const res = await fetch("https://api.sarvam.ai/text-to-speech", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "API-Subscription-Key": API_KEYS.sarvam },
-    body: JSON.stringify({
-      inputs: [text],
-      target_language_code: STATIC.sarvamLanguage,
-      speaker: STATIC.sarvamVoice,
-      pitch: 0,
-      pace: 1.1, // Slightly faster pace
-      loudness: 1.0,
-      speech_sample_rate: 8000,
-      enable_preprocessing: true,
-      model: "bulbul:v1",
-    }),
+// ElevenLabs WebSocket TTS streaming
+const elevenLabsStreamTTS = async (text, ws, ids, sessionId) => {
+  return new Promise(async (resolve) => {
+    try {
+      if (!API_KEYS.elevenlabs) throw new Error("Missing ELEVEN_API_KEY")
+      const url = `wss://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(ELEVEN_CONFIG.voiceId)}/stream-input?model_id=${encodeURIComponent(ELEVEN_CONFIG.modelId)}&inactivity_timeout=${ELEVEN_CONFIG.inactivityTimeout}&voice_settings=true&optimize_streaming_latency=2`
+      const headers = { 'xi-api-key': API_KEYS.elevenlabs }
+      const elWs = new WebSocket(url, { headers })
+
+      let opened = false
+      let resolved = false
+
+      const safeResolve = (ok) => { if (!resolved) { resolved = true; try { elWs.close() } catch (_) {}; resolve(ok) } }
+
+      elWs.on("open", () => {
+        opened = true
+        console.log(`[${ts()}] [11L-WS] open session=${sessionId}`)
+        // Initialize connection
+        const initMsg = {
+          text: "", // initialize
+          voice_settings: { stability: 0.3, similarity_boost: 0.7, style: 0.3 },
+          generation_config: { chunk_length_schedule: [120, 200] },
+          xi_api_key: API_KEYS.elevenlabs,
+        }
+        try { elWs.send(JSON.stringify({ ...initMsg, event: "initialize" })) } catch (_) {}
+        // Send the text
+        try { elWs.send(JSON.stringify({ event: "input_text", text })) } catch (_) {}
+        // Flush to force generation
+        try { elWs.send(JSON.stringify({ event: "flush" })) } catch (_) {}
+      })
+
+      elWs.on("message", async (data) => {
+        try {
+          // Messages can be binary audio or JSON. For simplicity, detect JSON first
+          let asText = null
+          if (Buffer.isBuffer(data)) {
+            // Assume PCM16 mono 16k if provided as raw; otherwise audio chunk base64 in JSON
+            // ElevenLabs WS typically returns JSON chunks with audio base64
+            asText = data.toString()
+          } else {
+            asText = String(data)
+          }
+          try {
+            const msg = JSON.parse(asText)
+            if (msg?.audio) {
+              // audio is base64 at model sample rate (usually 16000)
+              const down = downsamplePcm16kTo8kBase64(msg.audio)
+              await streamPcmToSanPBX(ws, ids, down, sessionId)
+            } else if (msg?.isFinal) {
+              console.log(`[${ts()}] [11L-WS] final session=${sessionId}`)
+            }
+          } catch (_) {
+            // Not JSON, ignore
+          }
+        } catch (_) {}
+      })
+
+      elWs.on("error", (e) => {
+        console.log(`[${ts()}] [11L-WS] error ${e?.message || ''}`)
+        safeResolve(false)
+      })
+      elWs.on("close", () => {
+        console.log(`[${ts()}] [11L-WS] close session=${sessionId}`)
+        safeResolve(true)
+      })
+
+      // Safety timeout
+      setTimeout(() => {
+        if (!opened) {
+          console.log(`[${ts()}] [11L-WS] timeout opening`)
+          safeResolve(false)
+        }
+      }, 5000)
+    } catch (e) {
+      console.log(`[${ts()}] [11L-WS] setup_error ${e.message}`)
+      resolve(false)
+    }
   })
-  if (!res.ok) throw new Error(`Sarvam TTS failed: ${res.status}`)
-  const data = await res.json()
-  const audioBase64 = data.audios && data.audios[0]
-  if (!audioBase64) throw new Error("Sarvam TTS: empty audio")
-  return extractPcmLinear16Mono8kBase64(audioBase64)
 }
 
 const respondWithOpenAI = async (userMessage, history = []) => {
@@ -381,32 +470,14 @@ const setupSanPbxWebSocketServer = (ws) => {
         const item = ttsQueue.shift()
         const sessionId = ++currentTTSSession
         ws.currentTTSSession = sessionId
-        
         console.log(`[${ts()}] [TTS-PLAY] start len=${item.length} session=${sessionId} text="${item}"`)
-        
-        try {
-          const pcm = await ttsWithSarvam(item)
-          const success = await streamPcmToSanPBX(ws, ids, pcm, sessionId)
-          
-          if (success) {
-            console.log(`[${ts()}] [TTS-PLAY] success len=${item.length} session=${sessionId}`)
-          } else {
-            console.log(`[${ts()}] [TTS-PLAY] cancelled len=${item.length} session=${sessionId}`)
-            // Clear remaining queue if cancelled
-            ttsQueue = []
-            break
-          }
-        } catch (e) {
-          console.log(`[${ts()}] [TTS-PLAY] error len=${item.length} session=${sessionId} error="${e.message}"`)
-          
-          // Skip problematic short texts but continue with queue
-          if (e.message.includes('400') && item.length < 5) {
-            console.log(`[${ts()}] [TTS-PLAY] skipping short text="${item}"`)
-            continue
-          } else {
-            // For other errors, stop processing
-            break
-          }
+        const ok = await elevenLabsStreamTTS(item, ws, ids, sessionId)
+        if (ok) {
+          console.log(`[${ts()}] [TTS-PLAY] success len=${item.length} session=${sessionId}`)
+        } else {
+          console.log(`[${ts()}] [TTS-PLAY] cancelled_or_error len=${item.length} session=${sessionId}`)
+          ttsQueue = []
+          break
         }
       }
     } catch (e) {
