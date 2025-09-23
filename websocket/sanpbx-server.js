@@ -7,7 +7,7 @@ const API_KEYS = {
   deepgram: process.env.DEEPGRAM_API_KEY,
   sarvam: process.env.SARVAM_API_KEY,
   openai: process.env.OPENAI_API_KEY,
-  elevenlabs: process.env.ELEVEN_API_KEY,
+  elevenlabs: process.env.ELEVEN_API_KEY || process.env.ELEVENLABS_API_KEY,
 }
 
 if (!API_KEYS.deepgram || !API_KEYS.sarvam || !API_KEYS.openai) {
