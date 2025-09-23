@@ -184,22 +184,21 @@ const elevenLabsStreamTTS = async (text, ws, ids, sessionId) => {
       elWs.on("open", () => {
         opened = true
         console.log(`[${ts()}] [11L-WS] open session=${sessionId}`)
-        // Initialize connection (output format controlled via URL)
+        // Initialize connection with a single-space text and api key per ElevenLabs guidance
         const initMsg = {
-          event: "initialize",
-          text: "",
+          text: " ",
+          xi_api_key: API_KEYS.elevenlabs,
           voice_settings: { stability: 0.3, similarity_boost: 0.7, style: 0.3 },
           generation_config: { chunk_length_schedule: [120, 200] },
-          modalities: ["audio"],
         }
         try { elWs.send(JSON.stringify(initMsg)) } catch (_) {}
         // Send the text
-        try { elWs.send(JSON.stringify({ event: "input_text", text })) } catch (_) {}
+        try { elWs.send(JSON.stringify({ text })) } catch (_) {}
         // Flush to force generation
-        try { elWs.send(JSON.stringify({ event: "flush" })) } catch (_) {}
+        try { elWs.send(JSON.stringify({ flush: true })) } catch (_) {}
         // Keep alive (space) every 10s
         keepAlive = setInterval(() => {
-          try { elWs.send(" ") } catch (_) {}
+          try { elWs.send(JSON.stringify({ text: " " })) } catch (_) {}
         }, 10000)
       })
 
