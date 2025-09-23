@@ -172,6 +172,7 @@ const elevenLabsStreamTTS = async (text, ws, ids, sessionId) => {
       const url = `wss://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(ELEVEN_CONFIG.voiceId)}/stream-input?model_id=${encodeURIComponent(ELEVEN_CONFIG.modelId)}&inactivity_timeout=${ELEVEN_CONFIG.inactivityTimeout}&output_format=pcm_8000&optimize_streaming_latency=3`
       const headers = { 'xi-api-key': API_KEYS.elevenlabs }
       const elWs = new WebSocket(url, { headers })
+      console.log(elWs)
 
       let opened = false
       let resolved = false
@@ -218,29 +219,46 @@ const elevenLabsStreamTTS = async (text, ws, ids, sessionId) => {
           // Messages can be binary audio or JSON. For simplicity, detect JSON first
           let asText = null
           if (Buffer.isBuffer(data)) {
-            // Binary path: treat as raw PCM8k mono (already 8k from ElevenLabs)
-            const pcm8kBuf = data
-            if (!firstAudioAt) firstAudioAt = Date.now()
-            console.log(`[${ts()}] [11L-AUDIO-BIN] bytes=${pcm8kBuf.length} (8kHz)`)
-            // Accumulate until we have enough for multiple 20ms frames (320 bytes @ 8kHz)
-            pcm8kAcc = Buffer.concat([pcm8kAcc, pcm8kBuf])
-            if (pcm8kAcc.length >= FRAME_BYTES * 5) { // ~100ms
-              const fullFrames = Math.floor(pcm8kAcc.length / FRAME_BYTES)
-              const sendLen = fullFrames * FRAME_BYTES
-              const toSend = pcm8kAcc.slice(0, sendLen)
-              const remainder = pcm8kAcc.slice(sendLen)
-              pcm8kAcc = remainder
-              await streamPcmToSanPBX(ws, ids, toSend.toString('base64'), sessionId)
+            // Some ElevenLabs control messages may arrive as binary JSON; detect and parse
+            const firstByte = data[0]
+            if (firstByte === 0x7B || firstByte === 0x5B) { // '{' or '['
+              asText = data.toString('utf8')
+            } else {
+              // Binary path: treat as raw PCM8k mono (already 8k from ElevenLabs)
+              const pcm8kBuf = data
+              if (!firstAudioAt) firstAudioAt = Date.now()
+              const b64 = pcm8kBuf.toString('base64')
+              console.log(`[${ts()}] [11L-AUDIO-BIN] bytes=${pcm8kBuf.length} (8kHz) preview_base64=${b64.slice(0,64)}...`)
+              // Accumulate until we have enough for multiple 20ms frames (320 bytes @ 8kHz)
+              pcm8kAcc = Buffer.concat([pcm8kAcc, pcm8kBuf])
+              if (pcm8kAcc.length >= FRAME_BYTES * 5) { // ~100ms
+                const fullFrames = Math.floor(pcm8kAcc.length / FRAME_BYTES)
+                const sendLen = fullFrames * FRAME_BYTES
+                const toSend = pcm8kAcc.slice(0, sendLen)
+                const remainder = pcm8kAcc.slice(sendLen)
+                pcm8kAcc = remainder
+                await streamPcmToSanPBX(ws, ids, toSend.toString('base64'), sessionId)
+              }
+              return
             }
-            return
           } else {
             asText = String(data)
           }
           try {
             const msg = JSON.parse(asText)
+            if (!msg) return
+            // Log control/meta messages from ElevenLabs
+            if (!msg.audio && !msg.isFinal && !msg.normalizedAlignment && !msg.alignment) {
+              console.log(`[${ts()}] [11L-WS-MSG] keys=${Object.keys(msg).join(',')} `)
+            }
             if (msg?.audio) {
               // audio is base64 PCM at 8000 Hz (requested)
               const base64Audio = msg.audio
+              if (!base64Audio || typeof base64Audio !== 'string' || base64Audio.length === 0) {
+                console.log(`[${ts()}] [11L-AUDIO-EMPTY] received empty/invalid audio field`)
+                return
+              }
+              console.log(`[${ts()}] [11L-AUDIO-JSON] base64_len=${base64Audio.length} preview=${base64Audio.slice(0,64)}...`)
               const pcm8kBuf = Buffer.from(base64Audio, 'base64')
               const sampleCount = Math.floor(pcm8kBuf.length / 2)
               if (!firstAudioAt) firstAudioAt = Date.now()
@@ -257,6 +275,8 @@ const elevenLabsStreamTTS = async (text, ws, ids, sessionId) => {
               }
             } else if (msg?.isFinal) {
               console.log(`[${ts()}] [11L-WS] final session=${sessionId}`)
+            } else if (msg && (msg.audio === null || msg.audio === undefined)) {
+              console.log(`[${ts()}] [11L-AUDIO-NULL] audio field is null/undefined; skipping`)
             }
           } catch (_) {
             // Not JSON, ignore
