@@ -164,6 +164,7 @@ const elevenLabsStreamTTS = async (text, ws, ids, sessionId) => {
       const url = `wss://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(ELEVEN_CONFIG.voiceId)}/stream-input?model_id=${encodeURIComponent(ELEVEN_CONFIG.modelId)}&inactivity_timeout=${ELEVEN_CONFIG.inactivityTimeout}&voice_settings=true&optimize_streaming_latency=2`
       const headers = { 'xi-api-key': API_KEYS.elevenlabs }
       const elWs = new WebSocket(url, { headers })
+      console.log(elWs)
 
       let opened = false
       let resolved = false
@@ -202,10 +203,21 @@ const elevenLabsStreamTTS = async (text, ws, ids, sessionId) => {
             const msg = JSON.parse(asText)
             if (msg?.audio) {
               // audio is base64 at model sample rate (usually 16000)
+              const base64Audio = msg.audio
+              const pcm16kBuf = Buffer.from(base64Audio, 'base64')
+              const sampleCount = Math.floor(pcm16kBuf.length / 2)
+              // Preview first up to 20 samples as signed 16-bit LE
+              const previewCount = Math.min(20, sampleCount)
+              const preview = []
+              for (let i = 0; i < previewCount; i++) {
+                preview.push(pcm16kBuf.readInt16LE(i * 2))
+              }
+              console.log(`[${ts()}] [11L-AUDIO-PCM16] sr=16000Hz ch=1 bytes=${pcm16kBuf.length} samples=${sampleCount} preview=${JSON.stringify(preview)}`)
+
               const resampleStart = Date.now()
-              const down = downsamplePcm16kTo8kBase64(msg.audio)
+              const down = downsamplePcm16kTo8kBase64(base64Audio)
               const resampleMs = Date.now() - resampleStart
-              console.log(`[${ts()}] [11L-AUDIO] chunk_received len=${msg.audio.length}B resample_ms=${resampleMs}`)
+              console.log(`[${ts()}] [11L-AUDIO] chunk_received base64_len=${base64Audio.length} resample_ms=${resampleMs}`)
               await streamPcmToSanPBX(ws, ids, down, sessionId)
             } else if (msg?.isFinal) {
               console.log(`[${ts()}] [11L-WS] final session=${sessionId}`)
