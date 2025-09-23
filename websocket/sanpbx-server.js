@@ -162,7 +162,7 @@ const elevenLabsStreamTTS = async (text, ws, ids, sessionId) => {
     try {
       if (!API_KEYS.elevenlabs) throw new Error("Missing ELEVEN_API_KEY")
       // Request PCM 8k directly to avoid resampling
-      const url = `wss://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(ELEVEN_CONFIG.voiceId)}/stream-input?model_id=${encodeURIComponent(ELEVEN_CONFIG.modelId)}&inactivity_timeout=${ELEVEN_CONFIG.inactivityTimeout}&output_format=pcm_8000&optimize_streaming_latency=3`
+      const url = `wss://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(ELEVEN_CONFIG.voiceId)}/stream-input?model_id=${encodeURIComponent(ELEVEN_CONFIG.modelId)}&inactivity_timeout=${ELEVEN_CONFIG.inactivityTimeout}&output_format=pcm_16000&optimize_streaming_latency=3`
       const headers = { 'xi-api-key': API_KEYS.elevenlabs }
       const elWs = new WebSocket(url, { headers })
 
