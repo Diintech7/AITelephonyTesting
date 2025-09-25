@@ -36,18 +36,18 @@ const ELEVEN_CONFIG = {
   inactivityTimeout: 120, // Reduced timeout
 }
 
-// OPTIMIZED latency configuration - much more aggressive
+// Enhanced latency and interruption configuration - FIXED VALUES
 const LATENCY_CONFIG = {
-  INTERIM_MIN_WORDS: 1,
-  INTERIM_DEBOUNCE_MS: 25,        // Faster interruption detection
-  CONFIDENCE_THRESHOLD: 0.3,       // Lower for faster detection
-  WORD_ACCUMULATION_MS: 50,
-  TTS_MIN_CHARS: 8,               // Longer minimum for complete sentences
-  TTS_DEBOUNCE_MS: 200,           // Allow more time for complete phrases
-  SILENCE_DETECTION_MS: 500,      // Longer silence detection to avoid premature interruption
-  INTERRUPTION_GRACE_MS: 800,     // Longer grace period to finish current sentence
-  MAX_CONCURRENT_TTS: 1,          // Only one TTS at a time
-  SENTENCE_COMPLETION_MS: 1000,   // Time to allow sentence completion
+  INTERIM_MIN_WORDS: 3,             // Require 3 words for interruption
+  INTERIM_DEBOUNCE_MS: 500,         // Prevent duplicate interims
+  CONFIDENCE_THRESHOLD: 0.7,        // Higher confidence for interruptions
+  WORD_ACCUMULATION_MS: 100,
+  TTS_MIN_CHARS: 5,                 // Shorter minimum for faster response
+  TTS_DEBOUNCE_MS: 150,             // Faster TTS response
+  SILENCE_DETECTION_MS: 400,        // Faster silence detection
+  INTERRUPTION_GRACE_MS: 600,       // Shorter grace period
+  MAX_CONCURRENT_TTS: 1,            
+  SENTENCE_COMPLETION_MS: 800,      // Reduced completion time
 }
 
 // History management configuration
@@ -797,6 +797,8 @@ const setupSanPbxWebSocketServer = (ws) => {
     
     try {
       while (ttsQueue.length > 0 && ws.readyState === WebSocket.OPEN) {
+        console.log(`[${ts()}] [TTS-QUEUE-PROCESSING] queue_size=${ttsQueue.length}`)
+        
         // Check for urgent interruption before processing
         const timeSinceUserInput = Date.now() - lastUserInputTime
         const shouldStop = userSpeechDetected && 
@@ -818,17 +820,20 @@ const setupSanPbxWebSocketServer = (ws) => {
         console.log(`[${ts()}] [TTS-PLAY] start len=${item.text.length} session=${sessionId} complete=${item.isComplete} priority=${priority} text="${item.text}"`)
         
         const startTime = Date.now()
-        const ok = await elevenLabsStreamTTS(item.text, ws, ids, sessionId, priority)
-        const duration = Date.now() - startTime
         
-        activeTTSSessions.delete(sessionId)
-        
-        if (ok) {
-          console.log(`[${ts()}] [TTS-PLAY] success len=${item.text.length} session=${sessionId} duration=${duration}ms`)
-        } else {
-          console.log(`[${ts()}] [TTS-PLAY] cancelled_or_error len=${item.text.length} session=${sessionId} duration=${duration}ms`)
-          // Don't clear entire queue if just one item fails
-          break
+        try {
+          const ok = await elevenLabsStreamTTS(item.text, ws, ids, sessionId, priority)
+          const duration = Date.now() - startTime
+          
+          if (ok) {
+            console.log(`[${ts()}] [TTS-PLAY] success len=${item.text.length} session=${sessionId} duration=${duration}ms`)
+          } else {
+            console.log(`[${ts()}] [TTS-PLAY] failed len=${item.text.length} session=${sessionId} duration=${duration}ms`)
+          }
+        } catch (error) {
+          console.log(`[${ts()}] [TTS-PLAY] error len=${item.text.length} session=${sessionId} error=${error.message}`)
+        } finally {
+          activeTTSSessions.delete(sessionId)
         }
         
         // Very small delay for interruption detection
@@ -840,12 +845,17 @@ const setupSanPbxWebSocketServer = (ws) => {
       ttsBusy = false
       
       if (ttsQueue.length > 0 && ws.readyState === WebSocket.OPEN) {
+        console.log(`[${ts()}] [TTS-QUEUE-CONTINUE] remaining_items=${ttsQueue.length}`)
         setTimeout(() => processTTSQueue(), 25)
       }
     }
   }
 
-  // Enhanced transcript handling with better interruption detection
+  // Prevent duplicate interim interruptions
+  let lastInterimText = ""
+  let lastInterimTime = 0
+  
+  // Handle interim transcript with smarter interruption detection
   const handleTranscript = async (text, isFinal = false, confidence = 1.0) => {
     try {
       const clean = (text || "").trim()
@@ -857,10 +867,16 @@ const setupSanPbxWebSocketServer = (ws) => {
       console.log(`[${ts()}] [TRANSCRIPT-${isFinal ? 'FINAL' : 'INTERIM'}] words=${wordCount} conf=${confidence.toFixed(2)} text="${clean}"`)
       
       if (!isFinal) {
-        // Handle interim transcript with smarter interruption detection
+        // Prevent duplicate interim processing
+        if (clean === lastInterimText && timestamp - lastInterimTime < 500) {
+          return // Skip duplicate interim within 500ms
+        }
+        lastInterimText = clean
+        lastInterimTime = timestamp
+        
         const isInterruption = conversationHistory.handleInterimTranscript(clean, timestamp)
         
-        if (isInterruption && confidence >= LATENCY_CONFIG.CONFIDENCE_THRESHOLD) {
+        if (isInterruption && confidence >= LATENCY_CONFIG.CONFIDENCE_THRESHOLD && wordCount >= 3) {
           userSpeechDetected = true
           lastUserInputTime = timestamp
           
@@ -877,6 +893,10 @@ const setupSanPbxWebSocketServer = (ws) => {
         
         return // Don't process interim transcripts
       } else {
+        // Reset interim tracking on final
+        lastInterimText = ""
+        lastInterimTime = 0
+        
         // Handle final transcript
         conversationHistory.addUserTranscript(clean, timestamp)
         userSpeechDetected = false
