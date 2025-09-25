@@ -194,6 +194,47 @@ const streamPcmToSanPBX = async (ws, { streamId, callId, channelId }, pcmBase64,
   return true
 }
 
+// Simple per-connection SIP send queue to ensure sequential audio playback
+const ensureSipQueue = (ws) => {
+  if (!ws.__sipQueue) {
+    ws.__sipQueue = []
+    ws.__sipSending = false
+  }
+}
+
+const processSipQueue = async (ws) => {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return
+  if (ws.__sipSending) return
+  ws.__sipSending = true
+  try {
+    while (ws.readyState === WebSocket.OPEN && ws.__sipQueue && ws.__sipQueue.length > 0) {
+      const item = ws.__sipQueue.shift()
+      const { ids, pcmBase64, sessionId, resolve } = item
+      let ok = false
+      try {
+        ok = await streamPcmToSanPBX(ws, ids, pcmBase64, sessionId)
+      } catch (_) {}
+      try { resolve(ok) } catch (_) {}
+      // If cancelled mid-send, continue to next queued item
+    }
+  } finally {
+    ws.__sipSending = false
+    // If new items arrived while sending flag was true, loop again
+    if (ws.__sipQueue && ws.__sipQueue.length > 0 && ws.readyState === WebSocket.OPEN) {
+      setImmediate(() => processSipQueue(ws))
+    }
+  }
+}
+
+const enqueuePcmToSip = (ws, ids, pcmBase64, sessionId) => {
+  return new Promise((resolve) => {
+    ensureSipQueue(ws)
+    ws.__sipQueue.push({ ids, pcmBase64, sessionId, resolve })
+    // Kick processor
+    processSipQueue(ws)
+  })
+}
+
 // ElevenLabs WebSocket TTS streaming (optimized for 8kHz PCM output)
 const elevenLabsStreamTTS = async (text, ws, ids, sessionId) => {
   return new Promise(async (resolve) => {
@@ -237,6 +278,8 @@ const elevenLabsStreamTTS = async (text, ws, ids, sessionId) => {
       let pcm8kAcc = Buffer.alloc(0)
       const FRAME_BYTES = 320 // 20ms @ 8kHz mono 16-bit
       let sentBytes = 0
+      // Track last queued promise so we resolve TTS only after final chunk is sent
+      let lastEnqueuePromise = Promise.resolve(true)
       let audioWatch = setTimeout(() => {
         if (!firstAudioAt) {
           console.log(`[${ts()}] [11L-WS] no_audio_yet 1500ms after open session=${sessionId}`)
@@ -272,7 +315,8 @@ const elevenLabsStreamTTS = async (text, ws, ids, sessionId) => {
                 const remainder = pcm8kAcc.slice(sendLen)
                 pcm8kAcc = remainder
                 sentBytes += toSend.length
-                await streamPcmToSanPBX(ws, ids, toSend.toString('base64'), sessionId)
+                lastEnqueuePromise = enqueuePcmToSip(ws, ids, toSend.toString('base64'), sessionId)
+                await lastEnqueuePromise
               }
               return
             }
@@ -313,7 +357,8 @@ const elevenLabsStreamTTS = async (text, ws, ids, sessionId) => {
                 const remainder = pcm8kAcc.slice(sendLen)
                 pcm8kAcc = remainder
                 sentBytes += toSend.length
-                await streamPcmToSanPBX(ws, ids, toSend.toString('base64'), sessionId)
+                lastEnqueuePromise = enqueuePcmToSip(ws, ids, toSend.toString('base64'), sessionId)
+                await lastEnqueuePromise
               }
             } else if (msg?.isFinal) {
               console.log(`[${ts()}] [11L-WS] final session=${sessionId}`)
@@ -354,11 +399,14 @@ const elevenLabsStreamTTS = async (text, ws, ids, sessionId) => {
               toSendBuf = Buffer.concat([pcm8kAcc, Buffer.alloc(FRAME_BYTES - pcm8kAcc.length)])
             }
             sentBytes += toSendBuf.length
-            await streamPcmToSanPBX(ws, ids, toSendBuf.toString('base64'), sessionId)
+            lastEnqueuePromise = enqueuePcmToSip(ws, ids, toSendBuf.toString('base64'), sessionId)
+            await lastEnqueuePromise
           }
         } catch (_) {}
         if (keepAlive) { clearInterval(keepAlive); keepAlive = null }
-        if (sentBytes <= 0) {
+      // Ensure queue drained before resolving
+      try { await lastEnqueuePromise } catch (_) {}
+      if (sentBytes <= 0) {
           console.log(`[${ts()}] [11L-NO-AUDIO] session=${sessionId} no_bytes_sent`)
           safeResolve(false)
         } else {
