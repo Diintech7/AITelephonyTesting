@@ -138,6 +138,11 @@ const streamPcmToSanPBX = async (ws, { streamId, callId, channelId }, pcmBase64,
   let sentChunks = 0
   
   while (position < audioBuffer.length && ws.readyState === WebSocket.OPEN) {
+    // Abort immediately if an interruption was detected
+    if (ws.__sipAbort === true) {
+      console.log(`[${ts()}] [SIP-AUDIO-ABORT] session=${sessionId || 'n/a'} aborted_by_interruption at_chunk=${sentChunks}`)
+      return false
+    }
     // FIXED: More lenient session checking - allow completion for higher priority or if already well into playback
     if (sessionId && ws.currentTTSSession !== sessionId && priority !== 'high') {
       const remainingMs = ((audioBuffer.length - position) / CHUNK_SIZE) * 20
@@ -179,7 +184,7 @@ const streamPcmToSanPBX = async (ws, { streamId, callId, channelId }, pcmBase64,
   }
   
   // Send silence frames for clean audio ending
-  if (!sessionId || ws.currentTTSSession === sessionId || priority === 'high') {
+  if ((!sessionId || ws.currentTTSSession === sessionId || priority === 'high') && ws.__sipAbort !== true) {
     try {
       for (let i = 0; i < 3; i++) {
         const silence = Buffer.alloc(CHUNK_SIZE).toString('base64')
@@ -199,6 +204,7 @@ const ensureSipQueue = (ws) => {
     ws.__sipQueue = []
     ws.__sipSending = false
     ws.__activeSipSessions = new Set()
+    ws.__sipAbort = false
   }
 }
 
@@ -235,6 +241,15 @@ const enqueuePcmToSip = (ws, ids, pcmBase64, sessionId, priority = 'normal') => 
     ws.__sipQueue.push({ ids, pcmBase64, sessionId, resolve, priority })
     processSipQueue(ws)
   })
+}
+
+// Abort all queued and in-flight SIP audio for this connection
+const abortSipQueue = (ws) => {
+  ensureSipQueue(ws)
+  ws.__sipAbort = true
+  ws.__sipQueue = []
+  // Allow any in-flight sender loop to observe abort flag and exit
+  setTimeout(() => { ws.__sipAbort = false }, 200)
 }
 
 // FIXED: ElevenLabs streaming with better session management
@@ -972,6 +987,8 @@ const setupSanPbxWebSocketServer = (ws) => {
             userSpeechDetected = true
             lastUserInputTime = timestamp
             ws.lastUserInputTime = timestamp
+            // Abort SIP playback immediately so new conversation can proceed
+            try { abortSipQueue(ws) } catch (_) {}
             
             if (silenceTimer) {
               clearTimeout(silenceTimer)
@@ -999,6 +1016,8 @@ const setupSanPbxWebSocketServer = (ws) => {
         }
         
         // Handle final transcript
+        // Abort any pending SIP audio to prioritize the new assistant response
+        try { abortSipQueue(ws) } catch (_) {}
         conversationHistory.addUserTranscript(clean, timestamp)
         userSpeechDetected = false
         
