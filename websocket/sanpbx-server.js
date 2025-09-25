@@ -406,8 +406,6 @@ const connectDeepgram = (language = STATIC.deepgramLanguage) => {
   url.searchParams.append("language", language)
   url.searchParams.append("interim_results", "true")
   url.searchParams.append("model", "nova-2")
-  url.searchParams.append("smart_format", "true")
-  url.searchParams.append("punctuate", "true")
   // Remove utterance_end_ms as it might cause issues
   
   console.log(`[${ts()}] [DEEPGRAM-CONNECT] ${url.toString()}`)
