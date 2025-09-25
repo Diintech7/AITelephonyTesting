@@ -46,7 +46,7 @@ const LATENCY_CONFIG = {
   TTS_MIN_CHARS: 5,                 
   TTS_DEBOUNCE_MS: 150,             
   SILENCE_DETECTION_MS: 600,        // FIXED: Longer silence detection
-  INTERRUPTION_GRACE_MS: 1200,      // FIXED: Longer grace period
+  INTERRUPTION_GRACE_MS: 200,      // FIXED: Longer grace period
   MAX_CONCURRENT_TTS: 1,            
   SENTENCE_COMPLETION_MS: 1500,     // FIXED: Longer completion time
   SESSION_CHANGE_GRACE_MS: 2000,    // FIXED: Grace period for session changes
