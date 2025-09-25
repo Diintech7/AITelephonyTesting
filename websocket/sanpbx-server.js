@@ -106,25 +106,36 @@ const downsamplePcm16kTo8kBase64 = (pcm16kBase64) => {
   }
 }
 
-// Downsample raw PCM 16-bit mono from 16kHz to 8kHz (Buffer version)
+// Downsample raw PCM 16-bit mono from 16kHz to 8kHz with simple low-pass prefilter to reduce aliasing
 const downsamplePcm16kTo8k = (pcm16kBuf) => {
   const start = Date.now()
   try {
-    const samples = Math.floor(pcm16kBuf.length / 2)
-    if (samples <= 0) return pcm16kBuf
-    const dst = Buffer.alloc(Math.floor(pcm16kBuf.length / 2))
-    // Copy every other 16-bit sample (little-endian)
-    let di = 0
-    for (let si = 0; si < samples; si += 2) {
-      const byteIndex = si * 2
-      if (byteIndex + 1 < pcm16kBuf.length && di + 1 < dst.length) {
-        dst[di++] = pcm16kBuf[byteIndex]
-        dst[di++] = pcm16kBuf[byteIndex + 1]
-      }
+    // Ensure even number of bytes
+    const byteLen = pcm16kBuf.length - (pcm16kBuf.length % 2)
+    if (byteLen <= 0) return pcm16kBuf
+    const srcView = new Int16Array(pcm16kBuf.buffer, pcm16kBuf.byteOffset, byteLen / 2)
+
+    // FIR low-pass prefilter: h = [1, 2, 2, 1] / 6 (simple halfband-ish)
+    // Then decimate by 2
+    const dstSamples = Math.floor(srcView.length / 2)
+    const outView = new Int16Array(dstSamples)
+
+    for (let i = 0, o = 0; o < dstSamples; o++, i += 2) {
+      const xm1 = i - 1 >= 0 ? srcView[i - 1] : 0
+      const x0 = srcView[i] || 0
+      const x1 = i + 1 < srcView.length ? srcView[i + 1] : 0
+      const x2 = i + 2 < srcView.length ? srcView[i + 2] : 0
+      let y = (xm1 + (x0 << 1) + (x1 << 1) + x2) / 6
+      // Clamp to int16
+      if (y > 32767) y = 32767
+      else if (y < -32768) y = -32768
+      outView[o] = y | 0
     }
+
+    const outBuf = Buffer.from(outView.buffer, outView.byteOffset, outView.byteLength)
     const ms = Date.now() - start
-    console.log(`[${ts()}] [DOWNSAMPLE] 16k_to_8k_ms=${ms} in_bytes=${pcm16kBuf.length} out_bytes=${dst.length}`)
-    return dst
+    console.log(`[${ts()}] [DOWNSAMPLE] 16k_to_8k_ms=${ms} in_bytes=${byteLen} out_bytes=${outBuf.length}`)
+    return outBuf
   } catch (e) {
     console.log(`[${ts()}] [DOWNSAMPLE] error ${e.message}`)
     return pcm16kBuf
