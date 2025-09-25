@@ -205,6 +205,7 @@ const ensureSipQueue = (ws) => {
     ws.__sipSending = false
     ws.__activeSipSessions = new Set()
     ws.__sipAbort = false
+    ws.__sipAbortSession = null
   }
 }
 
@@ -238,6 +239,11 @@ const processSipQueue = async (ws) => {
 const enqueuePcmToSip = (ws, ids, pcmBase64, sessionId, priority = 'normal') => {
   return new Promise((resolve) => {
     ensureSipQueue(ws)
+    // If previous session was aborted, but this is a new session, clear abort flags
+    if (ws.__sipAbort && ws.__sipAbortSession && ws.__sipAbortSession !== sessionId) {
+      ws.__sipAbort = false
+      ws.__sipAbortSession = null
+    }
     ws.__sipQueue.push({ ids, pcmBase64, sessionId, resolve, priority })
     processSipQueue(ws)
   })
@@ -250,7 +256,14 @@ const abortSipQueue = (ws, sessionId = null) => {
   ws.__sipAbortSession = sessionId || ws.currentTTSSession || null
   ws.__sipQueue = []
   // Allow any in-flight sender loop to observe abort flag and exit
-  setTimeout(() => { ws.__sipAbort = false; ws.__sipAbortSession = null }, 200)
+  setTimeout(() => { ws.__sipAbort = false; ws.__sipAbortSession = null }, 50)
+}
+
+// Reset any prior SIP abort so new sessions can play normally
+const resetSipAbort = (ws) => {
+  ensureSipQueue(ws)
+  ws.__sipAbort = false
+  ws.__sipAbortSession = null
 }
 
 // FIXED: ElevenLabs streaming with better session management
@@ -918,6 +931,8 @@ const setupSanPbxWebSocketServer = (ws) => {
         ws.lastTTSSessionChange = Date.now()
         lastTTSStartTime = Date.now()
         activeTTSSessions.add(sessionId)
+        // Clear any previous SIP abort for new session playback
+        try { resetSipAbort(ws) } catch (_) {}
         
         const priority = item.isComplete ? 'normal' : 'high'
         console.log(`[${ts()}] [TTS-PLAY] start len=${item.text.length} session=${sessionId} complete=${item.isComplete} priority=${priority} text="${item.text}"`)
