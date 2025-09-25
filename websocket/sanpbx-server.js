@@ -154,11 +154,6 @@ const streamPcmToSanPBX = async (ws, { streamId, callId, channelId }, pcmBase64,
   let position = 0
   
   while (position < audioBuffer.length && ws.readyState === WebSocket.OPEN) {
-    // Check if this TTS session is still valid (not cancelled by new user input)
-    if (sessionId && ws.currentTTSSession !== sessionId) {
-      console.log(`[${ts()}] [TTS-CANCEL] session=${sessionId} cancelled`)
-      return false
-    }
     
     const chunk = audioBuffer.slice(position, position + CHUNK_SIZE)
     const padded = chunk.length < CHUNK_SIZE ? Buffer.concat([chunk, Buffer.alloc(CHUNK_SIZE - chunk.length)]) : chunk
