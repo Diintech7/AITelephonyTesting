@@ -1041,7 +1041,7 @@ const setupSanPbxWebSocketServer = (ws) => {
         if (/[.!?]\s*$/.test(newContent)) return true
         if (sentences > 1) return true
         if (words >= 5 && /[,;:]\s*$/.test(newContent)) return true
-        if (newContent.length >= 40) return true
+        if (newContent.length >= 60) return true
         
         return false
       }
