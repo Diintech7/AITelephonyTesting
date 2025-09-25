@@ -400,7 +400,7 @@ const respondWithOpenAIStream = async (userMessage, history = []) => {
 const connectDeepgram = (language = STATIC.deepgramLanguage) => {
   // Use basic configuration that works reliably
   const url = new URL("wss://api.deepgram.com/v1/listen")
-  url.searchParams.append("sample_rate", "8000")  // Match SanPBX sample rate
+  url.searchParams.append("sample_rate", "44100")  // Match SanPBX sample rate
   url.searchParams.append("channels", "1")
   url.searchParams.append("encoding", "linear16") 
   url.searchParams.append("language", language)
