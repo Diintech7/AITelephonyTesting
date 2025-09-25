@@ -49,7 +49,7 @@ const LATENCY_CONFIG = {
 
 const ts = () => new Date().toISOString()
 
-// Enhanced downsample with noise reduction
+// Simplified audio processing
 const downsamplePcm16kTo8k = (pcm16kBuf) => {
   try {
     const byteLen = pcm16kBuf.length - (pcm16kBuf.length % 2)
@@ -59,21 +59,9 @@ const downsamplePcm16kTo8k = (pcm16kBuf) => {
     const dstSamples = Math.floor(srcView.length / 2)
     const outView = new Int16Array(dstSamples)
 
-    // Low-pass filter + decimation to reduce aliasing noise
+    // Simple decimation for speed
     for (let i = 0, o = 0; o < dstSamples; o++, i += 2) {
-      // Simple 3-tap filter to reduce aliasing
-      const prev = i > 0 ? srcView[i - 1] : 0
-      const curr = srcView[i] || 0
-      const next = i + 1 < srcView.length ? srcView[i + 1] : 0
-      
-      // Weighted average for smoother output
-      let filtered = (prev * 0.25 + curr * 0.5 + next * 0.25)
-      
-      // Clamp to prevent overflow
-      if (filtered > 32767) filtered = 32767
-      else if (filtered < -32768) filtered = -32768
-      
-      outView[o] = Math.round(filtered)
+      outView[o] = srcView[i] || 0
     }
 
     return Buffer.from(outView.buffer, outView.byteOffset, outView.byteLength)
@@ -146,7 +134,7 @@ const streamPcmToSanPBX = async (ws, { streamId, callId, channelId }, pcmBase64,
   return true
 }
 
-// Optimized ElevenLabs streaming with better audio quality
+// Optimized ElevenLabs streaming
 const elevenLabsStreamTTS = async (text, ws, ids, sessionId) => {
   return new Promise(async (resolve) => {
     try {
@@ -156,8 +144,7 @@ const elevenLabsStreamTTS = async (text, ws, ids, sessionId) => {
       ws.activeTTSSession = sessionId
       console.log(`[${ts()}] [TTS-START] session=${sessionId} text="${text}"`)
       
-      // Use standard model for better quality
-      const url = `wss://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_CONFIG.voiceId}/stream-input?model_id=eleven_multilingual_v2&output_format=pcm_16000`
+      const url = `wss://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_CONFIG.voiceId}/stream-input?model_id=${ELEVEN_CONFIG.modelId}&output_format=pcm_16000`
       const elWs = new WebSocket(url, { 
         headers: { 'xi-api-key': API_KEYS.elevenlabs } 
       })
@@ -176,11 +163,11 @@ const elevenLabsStreamTTS = async (text, ws, ids, sessionId) => {
         resolve(success)
       }
 
-      // Longer timeout for better quality model
+      // Timeout for faster failure detection
       const timeout = setTimeout(() => {
         console.log(`[${ts()}] [TTS-TIMEOUT] session=${sessionId}`)
         safeResolve(false)
-      }, 5000)
+      }, 3000)
 
       elWs.on("open", () => {
         // Check if still active session
@@ -192,18 +179,18 @@ const elevenLabsStreamTTS = async (text, ws, ids, sessionId) => {
         
         console.log(`[${ts()}] [TTS-CONNECTED] session=${sessionId}`)
         
-        // Initialize with high-quality settings
+        // Initialize with optimized settings
         const initMsg = {
           text: " ",
           xi_api_key: API_KEYS.elevenlabs,
           voice_settings: { 
-            stability: 0.5,      // More stable voice
-            similarity_boost: 0.8, // Higher similarity
-            style: 0.3,
+            stability: 0.4, 
+            similarity_boost: 0.6, 
+            style: 0.2,
             use_speaker_boost: true 
           },
           generation_config: { 
-            chunk_length_schedule: [100, 150, 200] // Balanced chunks
+            chunk_length_schedule: [80, 120, 160] // Faster chunks
           },
         }
         
@@ -219,7 +206,6 @@ const elevenLabsStreamTTS = async (text, ws, ids, sessionId) => {
 
       let pcmBuffer = Buffer.alloc(0)
       let firstAudioTime = null
-      let totalAudioBytes = 0
       
       elWs.on("message", async (data) => {
         try {
@@ -243,8 +229,6 @@ const elevenLabsStreamTTS = async (text, ws, ids, sessionId) => {
                 audioData = Buffer.from(msg.audio, 'base64')
               } else if (msg.isFinal) {
                 console.log(`[${ts()}] [TTS-FINAL] session=${sessionId}`)
-              } else if (msg.error) {
-                console.log(`[${ts()}] [TTS-MSG-ERROR] session=${sessionId} ${msg.error}`)
               }
             } catch (_) {}
           }
@@ -257,15 +241,13 @@ const elevenLabsStreamTTS = async (text, ws, ids, sessionId) => {
               console.log(`[${ts()}] [TTS-FIRST-AUDIO] session=${sessionId} latency=${latency}ms`)
             }
             
-            totalAudioBytes += audioData.length
-            
-            // Downsample with noise reduction
+            // Downsample and accumulate
             const pcm8k = downsamplePcm16kTo8k(audioData)
             pcmBuffer = Buffer.concat([pcmBuffer, pcm8k])
             
-            // Stream in optimized chunks
-            const STREAM_CHUNK_SIZE = 1600 // 100ms of audio for smoother playback
-            while (pcmBuffer.length >= STREAM_CHUNK_SIZE) {
+            // Stream in larger chunks for efficiency
+            const STREAM_CHUNK_SIZE = 3200 // 200ms of audio
+            if (pcmBuffer.length >= STREAM_CHUNK_SIZE) {
               const toStream = pcmBuffer.slice(0, STREAM_CHUNK_SIZE)
               pcmBuffer = pcmBuffer.slice(STREAM_CHUNK_SIZE)
               
@@ -283,12 +265,12 @@ const elevenLabsStreamTTS = async (text, ws, ids, sessionId) => {
       })
 
       elWs.on("close", async () => {
-        console.log(`[${ts()}] [TTS-CLOSED] session=${sessionId} total_audio=${totalAudioBytes}bytes`)
+        console.log(`[${ts()}] [TTS-CLOSED] session=${sessionId}`)
         
         // Stream remaining audio
         if (pcmBuffer.length > 0 && ws.activeTTSSession === sessionId) {
           try {
-            // Pad to minimum chunk size if needed
+            // Pad to minimum chunk size
             const minSize = 320
             if (pcmBuffer.length < minSize) {
               pcmBuffer = Buffer.concat([pcmBuffer, Buffer.alloc(minSize - pcmBuffer.length)])
@@ -298,7 +280,7 @@ const elevenLabsStreamTTS = async (text, ws, ids, sessionId) => {
         }
         
         clearTimeout(timeout)
-        safeResolve(audioReceived && totalAudioBytes > 0)
+        safeResolve(audioReceived)
       })
 
       elWs.on("error", (e) => {
@@ -398,18 +380,18 @@ const respondWithOpenAIStream = async (userMessage, history = []) => {
 }
 
 const connectDeepgram = (language = STATIC.deepgramLanguage) => {
-  // Use basic configuration that works reliably
   const url = new URL("wss://api.deepgram.com/v1/listen")
-  url.searchParams.append("sample_rate", "44100")  // Match SanPBX sample rate
+  url.searchParams.append("sample_rate", "44100")
   url.searchParams.append("channels", "1")
   url.searchParams.append("encoding", "linear16") 
   url.searchParams.append("language", language)
   url.searchParams.append("interim_results", "true")
   url.searchParams.append("model", "nova-2")
-  // Remove utterance_end_ms as it might cause issues
+  url.searchParams.append("smart_format", "true")
+  url.searchParams.append("punctuate", "true")
+  url.searchParams.append("utterance_end_ms", "800") // Faster utterance detection
   
   console.log(`[${ts()}] [DEEPGRAM-CONNECT] ${url.toString()}`)
-  console.log(`[${ts()}] [DEEPGRAM-AUTH] key=${API_KEYS.deepgram ? 'present' : 'missing'}`)
   
   return new WebSocket(url.toString(), { 
     headers: { Authorization: `Token ${API_KEYS.deepgram}` } 
@@ -617,8 +599,6 @@ const setupSanPbxWebSocketServer = (ws) => {
         } else if (msg.type === "UtteranceEnd") {
           console.log(`[${ts()}] [UTTERANCE-END]`)
           userSpeaking = false
-        } else if (msg.type === "Metadata") {
-          console.log(`[${ts()}] [DEEPGRAM-META] request_id=${msg.request_id}`)
         }
       } catch (e) {
         console.log(`[${ts()}] [DEEPGRAM-MSG-ERROR] ${e.message}`)
@@ -630,19 +610,9 @@ const setupSanPbxWebSocketServer = (ws) => {
       console.log(`[${ts()}] [DEEPGRAM-ERROR] ${e.message}`)
     }
     
-    deepgramWs.onclose = (evt) => {
+    deepgramWs.onclose = () => {
       deepgramReady = false
-      console.log(`[${ts()}] [DEEPGRAM-CLOSED] code=${evt.code} reason=${evt.reason}`)
-      
-      // Retry connection if needed
-      if (ids.streamId && evt.code !== 1000) {
-        console.log(`[${ts()}] [DEEPGRAM-RETRY] reconnecting in 2s...`)
-        setTimeout(() => {
-          if (ids.streamId) { // Check if still needed
-            bootDeepgram()
-          }
-        }, 2000)
-      }
+      console.log(`[${ts()}] [DEEPGRAM-CLOSED]`)
     }
   }
 
