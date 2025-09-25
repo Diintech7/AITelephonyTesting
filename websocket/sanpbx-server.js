@@ -251,6 +251,7 @@ const elevenLabsStreamTTS = async (text, ws, ids, sessionId, priority = 'normal'
       let resolved = false
       let audioStarted = false
       let totalSentBytes = 0
+      let finalized = false
 
       const safeResolve = (ok) => { 
         if (!resolved) { 
@@ -261,6 +262,13 @@ const elevenLabsStreamTTS = async (text, ws, ids, sessionId, priority = 'normal'
       }
 
       let keepAlive = null
+
+      const finalizeStream = () => {
+        if (finalized) return
+        finalized = true
+        try { elWs.send(JSON.stringify({ text: "" })) } catch (_) {}
+        setTimeout(() => { try { elWs.close() } catch (_) {} }, 100)
+      }
 
       elWs.on("open", () => {
         // FIXED: More lenient session checking - allow high priority and grace period
@@ -290,6 +298,8 @@ const elevenLabsStreamTTS = async (text, ws, ids, sessionId, priority = 'normal'
         try { elWs.send(JSON.stringify(initMsg)) } catch (_) {}
         try { elWs.send(JSON.stringify({ text: text + " " })) } catch (_) {}
         try { elWs.send(JSON.stringify({ flush: true })) } catch (_) {}
+        // Proactively end after flush so the server delivers remaining audio and closes
+        setTimeout(() => finalizeStream(), 500)
         
         keepAlive = setInterval(() => {
           // FIXED: More lenient keepalive checking
@@ -385,6 +395,7 @@ const elevenLabsStreamTTS = async (text, ws, ids, sessionId, priority = 'normal'
               }
             } else if (msg?.isFinal) {
               console.log(`[${ts()}] [11L-WS] final session=${sessionId}`)
+              finalizeStream()
             }
           } catch (_) {}
         } catch (_) {}
