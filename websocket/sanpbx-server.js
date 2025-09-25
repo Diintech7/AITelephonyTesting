@@ -177,7 +177,7 @@ const streamPcmToSanPBX = async (ws, { streamId, callId, channelId }, pcmBase64,
       for (let i = 0; i < 2; i++) { // Reduced from 3
         const silence = Buffer.alloc(CHUNK_SIZE).toString('base64')
         // Debug: log silence base64 payload
-        try { console.log(`[${ts()}] [SIP-AUDIO-SILENCE] base64=${silence}`) } catch (_) {}
+        try {  } catch (_) {}
         ws.send(JSON.stringify({ event: "reverse-media", payload: silence, streamId, channelId, callId }))
         await new Promise(r => setTimeout(r, 20))
       }
