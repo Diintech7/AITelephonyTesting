@@ -36,25 +36,27 @@ const ELEVEN_CONFIG = {
   inactivityTimeout: 120, // Reduced timeout
 }
 
-// Enhanced latency and interruption configuration - FIXED VALUES
+// FIXED: Enhanced latency and interruption configuration
 const LATENCY_CONFIG = {
-  INTERIM_MIN_WORDS: 3,             // Require 3 words for interruption
-  INTERIM_DEBOUNCE_MS: 500,         // Prevent duplicate interims
-  CONFIDENCE_THRESHOLD: 0.7,        // Higher confidence for interruptions
+  INTERIM_MIN_WORDS: 4,             // FIXED: Require 4 words for interruption (was 3)
+  INTERIM_MIN_LENGTH: 10,           // FIXED: Minimum character length
+  INTERIM_DEBOUNCE_MS: 800,         // FIXED: Longer debounce to prevent false positives
+  CONFIDENCE_THRESHOLD: 0.85,       // FIXED: Higher confidence for interruptions (was 0.7)
   WORD_ACCUMULATION_MS: 100,
-  TTS_MIN_CHARS: 5,                 // Shorter minimum for faster response
-  TTS_DEBOUNCE_MS: 150,             // Faster TTS response
-  SILENCE_DETECTION_MS: 400,        // Faster silence detection
-  INTERRUPTION_GRACE_MS: 600,       // Shorter grace period
+  TTS_MIN_CHARS: 5,                 
+  TTS_DEBOUNCE_MS: 150,             
+  SILENCE_DETECTION_MS: 600,        // FIXED: Longer silence detection
+  INTERRUPTION_GRACE_MS: 1200,      // FIXED: Longer grace period
   MAX_CONCURRENT_TTS: 1,            
-  SENTENCE_COMPLETION_MS: 800,      // Reduced completion time
+  SENTENCE_COMPLETION_MS: 1500,     // FIXED: Longer completion time
+  SESSION_CHANGE_GRACE_MS: 2000,    // FIXED: Grace period for session changes
 }
 
 // History management configuration
 const HISTORY_CONFIG = {
   MAX_HISTORY_LENGTH: 20,
   TRANSCRIPT_MERGE_TIMEOUT: 2000,
-  MIN_TRANSCRIPT_WORDS: 1,
+  MIN_TRANSCRIPT_WORDS: 2,  // FIXED: Require at least 2 words
 }
 
 // Timestamp helper with milliseconds
@@ -120,7 +122,7 @@ const downsamplePcm16kTo8k = (pcm16kBuf) => {
   }
 }
 
-// IMPROVED: Sequential SIP audio streaming to prevent overlap
+// FIXED: Sequential SIP audio streaming with better completion handling
 const streamPcmToSanPBX = async (ws, { streamId, callId, channelId }, pcmBase64, sessionId, priority = 'normal') => {
   if (!ws || ws.readyState !== WebSocket.OPEN) return false
   if (!streamId || !callId || !channelId) return false
@@ -136,14 +138,20 @@ const streamPcmToSanPBX = async (ws, { streamId, callId, channelId }, pcmBase64,
   let sentChunks = 0
   
   while (position < audioBuffer.length && ws.readyState === WebSocket.OPEN) {
-    // More lenient session checking - allow completion if already started
+    // FIXED: More lenient session checking - allow completion for higher priority or if already well into playback
     if (sessionId && ws.currentTTSSession !== sessionId && priority !== 'high') {
       const remainingMs = ((audioBuffer.length - position) / CHUNK_SIZE) * 20
-      if (remainingMs > LATENCY_CONFIG.SENTENCE_COMPLETION_MS) {
-        console.log(`[${ts()}] [SIP-AUDIO-INTERRUPTED] session=${sessionId} current=${ws.currentTTSSession} remaining_ms=${remainingMs}`)
+      const playedPercentage = (position / audioBuffer.length) * 100
+      const timeSinceSessionChange = Date.now() - (ws.lastTTSSessionChange || 0)
+      
+      // Allow completion if we're far enough in or session change was recent
+      if (remainingMs > LATENCY_CONFIG.SENTENCE_COMPLETION_MS && 
+          playedPercentage < 50 && 
+          timeSinceSessionChange > LATENCY_CONFIG.SESSION_CHANGE_GRACE_MS) {
+        console.log(`[${ts()}] [SIP-AUDIO-INTERRUPTED] session=${sessionId} current=${ws.currentTTSSession} remaining_ms=${remainingMs} played=${playedPercentage.toFixed(1)}%`)
         return false
       } else {
-        console.log(`[${ts()}] [SIP-AUDIO-COMPLETING] session=${sessionId} remaining_ms=${remainingMs}`)
+        console.log(`[${ts()}] [SIP-AUDIO-COMPLETING] session=${sessionId} remaining_ms=${remainingMs} played=${playedPercentage.toFixed(1)}%`)
       }
     }
     
@@ -186,7 +194,7 @@ const streamPcmToSanPBX = async (ws, { streamId, callId, channelId }, pcmBase64,
   return true
 }
 
-// IMPROVED: Better queue management with completion tracking
+// FIXED: Better queue management with completion tracking
 const ensureSipQueue = (ws) => {
   if (!ws.__sipQueue) {
     ws.__sipQueue = []
@@ -230,11 +238,12 @@ const enqueuePcmToSip = (ws, ids, pcmBase64, sessionId, priority = 'normal') => 
   })
 }
 
-// OPTIMIZED: ElevenLabs streaming with better buffering and completion
+// FIXED: ElevenLabs streaming with better session management
 const elevenLabsStreamTTS = async (text, ws, ids, sessionId, priority = 'normal') => {
   return new Promise(async (resolve) => {
     try {
       if (!API_KEYS.elevenlabs) throw new Error("Missing ELEVEN_API_KEY")
+      
       const url = `wss://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(ELEVEN_CONFIG.voiceId)}/stream-input?model_id=${encodeURIComponent(ELEVEN_CONFIG.modelId)}&inactivity_timeout=${ELEVEN_CONFIG.inactivityTimeout}&output_format=pcm_16000`
       const headers = { 'xi-api-key': API_KEYS.elevenlabs }
       const elWs = new WebSocket(url, { headers })
@@ -255,11 +264,14 @@ const elevenLabsStreamTTS = async (text, ws, ids, sessionId, priority = 'normal'
       let keepAlive = null
 
       elWs.on("open", () => {
-        // Less aggressive session checking for completion
+        // FIXED: More lenient session checking - allow high priority and grace period
         if (sessionId && ws.currentTTSSession !== sessionId && priority !== 'high') {
-          console.log(`[${ts()}] [11L-WS] session_invalid_on_open session=${sessionId} current=${ws.currentTTSSession}`)
-          safeResolve(false)
-          return
+          const timeSinceSessionChange = Date.now() - (ws.lastTTSSessionChange || 0)
+          if (timeSinceSessionChange < LATENCY_CONFIG.SESSION_CHANGE_GRACE_MS) {
+            console.log(`[${ts()}] [11L-WS] session_change_too_recent session=${sessionId} grace=${timeSinceSessionChange}ms`)
+            safeResolve(false)
+            return
+          }
         }
         
         opened = true
@@ -281,11 +293,14 @@ const elevenLabsStreamTTS = async (text, ws, ids, sessionId, priority = 'normal'
         try { elWs.send(JSON.stringify({ flush: true })) } catch (_) {}
         
         keepAlive = setInterval(() => {
-          // More lenient keepalive checking
+          // FIXED: More lenient keepalive checking
           if (sessionId && ws.currentTTSSession !== sessionId && priority !== 'high' && !audioStarted) {
-            console.log(`[${ts()}] [11L-WS] session_expired_keepalive session=${sessionId}`)
-            safeResolve(false)
-            return
+            const timeSinceLastUserInput = Date.now() - (ws.lastUserInputTime || 0)
+            if (timeSinceLastUserInput < 3000) { // Only stop if very recent user input
+              console.log(`[${ts()}] [11L-WS] session_expired_keepalive session=${sessionId}`)
+              safeResolve(false)
+              return
+            }
           }
           try { elWs.send(JSON.stringify({ text: " " })) } catch (_) {}
         }, 8000)
@@ -298,11 +313,16 @@ const elevenLabsStreamTTS = async (text, ws, ids, sessionId, priority = 'normal'
 
       elWs.on("message", async (data) => {
         try {
-          // More lenient session checking during playback
-          if (sessionId && ws.currentTTSSession !== sessionId && priority !== 'high' && !audioStarted) {
-            console.log(`[${ts()}] [11L-WS] session_invalid_on_message session=${sessionId} current=${ws.currentTTSSession}`)
-            safeResolve(false)
-            return
+          // FIXED: More lenient session checking during playback
+          if (sessionId && ws.currentTTSSession !== sessionId && priority !== 'high') {
+            const timeSinceLastUserInput = Date.now() - (ws.lastUserInputTime || 0)
+            const allowCompletion = audioStarted && timeSinceLastUserInput > 2000
+            
+            if (!allowCompletion) {
+              console.log(`[${ts()}] [11L-WS] session_invalid_on_message session=${sessionId} allow_completion=${allowCompletion}`)
+              safeResolve(false)
+              return
+            }
           }
           
           let asText = null
@@ -530,7 +550,7 @@ const connectDeepgram = (language = STATIC.deepgramLanguage) => {
   })
 }
 
-// Enhanced history manager class
+// FIXED: Enhanced history manager class with stricter interruption detection
 class ConversationHistory {
   constructor() {
     this.entries = []
@@ -587,9 +607,32 @@ class ConversationHistory {
     this.trimHistory()
   }
 
+  // FIXED: Much stricter interruption detection
   handleInterimTranscript(text, timestamp = Date.now()) {
     const clean = text.trim()
     if (!clean) return false
+    
+    // FIXED: Much more strict criteria for considering something an "interruption"
+    const wordCount = clean.split(/\s+/).length
+    const isLongEnough = clean.length >= LATENCY_CONFIG.INTERIM_MIN_LENGTH
+    const hasEnoughWords = wordCount >= LATENCY_CONFIG.INTERIM_MIN_WORDS
+    
+    // FIXED: Filter out common false positives
+    const isFillerWords = /^(hello|hi|hey|um|uh|er|ah|hmm|well|okay|ok|yes|no|yeah|yep|nope|what|huh|sorry)(\s|$)/i.test(clean)
+    const isNoiseOrGibberish = /^[^a-zA-Z]*$/.test(clean) || clean.length < 3
+    const isRepeatedChar = /^(.)\1+$/.test(clean)
+    
+    // FIXED: Require substantial, meaningful speech
+    const hasSubstance = isLongEnough && 
+                        hasEnoughWords && 
+                        !isFillerWords && 
+                        !isNoiseOrGibberish && 
+                        !isRepeatedChar
+    
+    if (!hasSubstance) {
+      console.log(`[${ts()}] [INTERIM-FILTERED] text="${clean}" words=${wordCount} len=${clean.length} substance=${hasSubstance}`)
+      return false
+    }
     
     this.pendingTranscript = clean
     this.lastTranscriptTime = timestamp
@@ -605,8 +648,8 @@ class ConversationHistory {
       }
     }, HISTORY_CONFIG.TRANSCRIPT_MERGE_TIMEOUT)
     
-    const wordCount = clean.split(/\s+/).length
-    return wordCount >= 2 // Require at least 2 words for interruption
+    console.log(`[${ts()}] [INTERIM-VALID] text="${clean}" words=${wordCount} len=${clean.length}`)
+    return true // Only return true for substantial, meaningful speech
   }
 
   getConversationHistory() {
@@ -646,10 +689,12 @@ const setupSanPbxWebSocketServer = (ws) => {
   
   const conversationHistory = new ConversationHistory()
   
-  // Improved session management
+  // FIXED: Improved session management with tracking variables
   let currentLLMSession = 0
   let currentTTSSession = 0
   ws.currentTTSSession = 0
+  ws.lastTTSSessionChange = 0
+  ws.lastUserInputTime = 0
   
   // STT latency markers
   let sttStartTs = null
@@ -657,16 +702,23 @@ const setupSanPbxWebSocketServer = (ws) => {
   let firstForwardToDgTs = null
   let firstDgMsgTs = null
   
-  // User speech detection with completion tracking
+  // FIXED: User speech detection with better tracking
   let userSpeechDetected = false
   let lastUserInputTime = 0
+  let lastTTSStartTime = 0
   let silenceTimer = null
   let activeTTSSessions = new Set()
+  
+  // FIXED: Interruption tracking to prevent duplicates
+  let lastInterimText = ""
+  let lastInterimTime = 0
   
   const sendGreeting = async () => {
     try {
       const sessionId = ++currentTTSSession
       ws.currentTTSSession = sessionId
+      ws.lastTTSSessionChange = Date.now()
+      lastTTSStartTime = Date.now()
       activeTTSSessions.add(sessionId)
       
       const ok = await elevenLabsStreamTTS(STATIC.firstMessage, ws, ids, sessionId, 'high')
@@ -677,7 +729,7 @@ const setupSanPbxWebSocketServer = (ws) => {
     } catch (_) {}
   }
 
-  // IMPROVED: Smarter TTS queue with sentence completion
+  // FIXED: Smarter TTS queue with sentence completion
   let ttsQueue = []
   let ttsBusy = false
   let speakBuffer = ""
@@ -685,7 +737,7 @@ const setupSanPbxWebSocketServer = (ws) => {
   const PUNCTUATION_FLUSH = /([.!?]\s?$|[;:，。！？]$|\n\s*$)/
   const SENTENCE_BOUNDARIES = /([.!?]+\s+|[.!?]+$)/
   
-  // Smart interruption handling - only interrupt between sentences
+  // FIXED: Smart interruption handling - only interrupt between sentences or with very high confidence
   const clearTTSOperations = (forceAll = false) => {
     if (forceAll) {
       // Emergency stop - clear everything
@@ -699,15 +751,27 @@ const setupSanPbxWebSocketServer = (ws) => {
       const oldSession = currentTTSSession
       currentTTSSession += 2
       ws.currentTTSSession = currentTTSSession
+      ws.lastTTSSessionChange = Date.now()
       activeTTSSessions.clear()
       console.log(`[${ts()}] [INTERRUPTION] force_cleared_all_tts old_session=${oldSession} new_session=${currentTTSSession}`)
     } else {
-      // Gentle stop - let current sentence finish
+      // FIXED: Gentler stop - don't clear if audio just started or if we're mid-sentence
+      const timeSinceLastTTS = Date.now() - lastTTSStartTime
+      const hasActiveSessions = activeTTSSessions.size > 0
+      
+      if (timeSinceLastTTS < 800 && hasActiveSessions) {
+        console.log(`[${ts()}] [INTERRUPTION] ignored_recent_tts_start time=${timeSinceLastTTS}ms active_sessions=${hasActiveSessions}`)
+        return false // Don't interrupt
+      }
+      
       ttsQueue = []
       const oldSession = currentTTSSession
       currentTTSSession += 1
+      ws.lastTTSSessionChange = Date.now()
       console.log(`[${ts()}] [INTERRUPTION] cleared_queue_only old_session=${oldSession} new_session=${currentTTSSession}`)
+      return true
     }
+    return true
   }
   
   const isCompleteSentence = (text) => {
@@ -731,8 +795,8 @@ const setupSanPbxWebSocketServer = (ws) => {
       return
     }
     
-    // Limit queue size but allow sentence completion
-    if (ttsQueue.length >= 2) {
+    // FIXED: More lenient queue size management
+    if (ttsQueue.length >= 3) {
       console.log(`[${ts()}] [TTS-QUEUE-LIMIT] dropping chunk="${chunk}" queue_size=${ttsQueue.length}`)
       return
     }
@@ -750,7 +814,7 @@ const setupSanPbxWebSocketServer = (ws) => {
   const queueSpeech = (text, force = false) => {
     if (!text || !text.trim()) return
     
-    // Check for user interruption with grace period for sentence completion
+    // FIXED: Check for user interruption with longer grace period for sentence completion
     const timeSinceUserInput = Date.now() - lastUserInputTime
     const allowCompletion = activeTTSSessions.size > 0 && timeSinceUserInput < LATENCY_CONFIG.SENTENCE_COMPLETION_MS
     
@@ -799,7 +863,7 @@ const setupSanPbxWebSocketServer = (ws) => {
       while (ttsQueue.length > 0 && ws.readyState === WebSocket.OPEN) {
         console.log(`[${ts()}] [TTS-QUEUE-PROCESSING] queue_size=${ttsQueue.length}`)
         
-        // Check for urgent interruption before processing
+        // FIXED: Check for urgent interruption before processing
         const timeSinceUserInput = Date.now() - lastUserInputTime
         const shouldStop = userSpeechDetected && 
                           timeSinceUserInput < LATENCY_CONFIG.INTERRUPTION_GRACE_MS &&
@@ -814,6 +878,8 @@ const setupSanPbxWebSocketServer = (ws) => {
         const item = ttsQueue.shift()
         const sessionId = ++currentTTSSession
         ws.currentTTSSession = sessionId
+        ws.lastTTSSessionChange = Date.now()
+        lastTTSStartTime = Date.now()
         activeTTSSessions.add(sessionId)
         
         const priority = item.isComplete ? 'normal' : 'high'
@@ -836,8 +902,8 @@ const setupSanPbxWebSocketServer = (ws) => {
           activeTTSSessions.delete(sessionId)
         }
         
-        // Very small delay for interruption detection
-        await new Promise(resolve => setTimeout(resolve, 25))
+        // Small delay for interruption detection
+        await new Promise(resolve => setTimeout(resolve, 50))
       }
     } catch (e) {
       console.log(`[${ts()}] [TTS-QUEUE-ERROR] ${e.message}`)
@@ -846,16 +912,12 @@ const setupSanPbxWebSocketServer = (ws) => {
       
       if (ttsQueue.length > 0 && ws.readyState === WebSocket.OPEN) {
         console.log(`[${ts()}] [TTS-QUEUE-CONTINUE] remaining_items=${ttsQueue.length}`)
-        setTimeout(() => processTTSQueue(), 25)
+        setTimeout(() => processTTSQueue(), 50)
       }
     }
   }
 
-  // Prevent duplicate interim interruptions
-  let lastInterimText = ""
-  let lastInterimTime = 0
-  
-  // Handle interim transcript with smarter interruption detection
+  // FIXED: Handle interim transcript with much stricter interruption detection
   const handleTranscript = async (text, isFinal = false, confidence = 1.0) => {
     try {
       const clean = (text || "").trim()
@@ -867,28 +929,40 @@ const setupSanPbxWebSocketServer = (ws) => {
       console.log(`[${ts()}] [TRANSCRIPT-${isFinal ? 'FINAL' : 'INTERIM'}] words=${wordCount} conf=${confidence.toFixed(2)} text="${clean}"`)
       
       if (!isFinal) {
-        // Prevent duplicate interim processing
-        if (clean === lastInterimText && timestamp - lastInterimTime < 500) {
-          return // Skip duplicate interim within 500ms
+        // FIXED: Prevent duplicate interim processing with longer debounce
+        if (clean === lastInterimText && timestamp - lastInterimTime < LATENCY_CONFIG.INTERIM_DEBOUNCE_MS) {
+          console.log(`[${ts()}] [INTERIM-DUPLICATE] skipping duplicate interim within ${LATENCY_CONFIG.INTERIM_DEBOUNCE_MS}ms`)
+          return
         }
         lastInterimText = clean
         lastInterimTime = timestamp
         
         const isInterruption = conversationHistory.handleInterimTranscript(clean, timestamp)
         
-        if (isInterruption && confidence >= LATENCY_CONFIG.CONFIDENCE_THRESHOLD && wordCount >= 3) {
-          userSpeechDetected = true
-          lastUserInputTime = timestamp
+        // FIXED: Much stricter interruption criteria
+        const isHighConfidence = confidence >= LATENCY_CONFIG.CONFIDENCE_THRESHOLD
+        const isSubstantialSpeech = wordCount >= LATENCY_CONFIG.INTERIM_MIN_WORDS
+        const isLongEnough = clean.length >= LATENCY_CONFIG.INTERIM_MIN_LENGTH
+        
+        if (isInterruption && isHighConfidence && isSubstantialSpeech && isLongEnough) {
+          const wasInterrupted = clearTTSOperations(false)
           
-          // Smart interruption - gentle stop first
-          clearTTSOperations(false)
-          
-          if (silenceTimer) {
-            clearTimeout(silenceTimer)
-            silenceTimer = null
+          if (wasInterrupted) {
+            userSpeechDetected = true
+            lastUserInputTime = timestamp
+            ws.lastUserInputTime = timestamp
+            
+            if (silenceTimer) {
+              clearTimeout(silenceTimer)
+              silenceTimer = null
+            }
+            
+            console.log(`[${ts()}] [INTERRUPTION-DETECTED] interim_text="${clean}" conf=${confidence.toFixed(2)} words=${wordCount} len=${clean.length}`)
+          } else {
+            console.log(`[${ts()}] [INTERRUPTION-IGNORED] recent_tts_start interim_text="${clean}"`)
           }
-          
-          console.log(`[${ts()}] [INTERRUPTION-DETECTED] interim_text="${clean}" conf=${confidence.toFixed(2)}`)
+        } else {
+          console.log(`[${ts()}] [INTERIM-IGNORED] conf=${confidence.toFixed(2)} words=${wordCount} len=${clean.length} interruption=${isInterruption}`)
         }
         
         return // Don't process interim transcripts
@@ -896,6 +970,12 @@ const setupSanPbxWebSocketServer = (ws) => {
         // Reset interim tracking on final
         lastInterimText = ""
         lastInterimTime = 0
+        
+        // FIXED: Only process final transcripts with substantial content
+        if (wordCount < HISTORY_CONFIG.MIN_TRANSCRIPT_WORDS) {
+          console.log(`[${ts()}] [TRANSCRIPT-SKIP] too_few_words="${clean}" words=${wordCount}`)
+          return
+        }
         
         // Handle final transcript
         conversationHistory.addUserTranscript(clean, timestamp)
@@ -1090,9 +1170,16 @@ const setupSanPbxWebSocketServer = (ws) => {
           currentLLMSession = 0
           currentTTSSession = 0
           ws.currentTTSSession = 0
+          ws.lastTTSSessionChange = 0
+          ws.lastUserInputTime = 0
           userSpeechDetected = false
           lastUserInputTime = 0
+          lastTTSStartTime = 0
           activeTTSSessions.clear()
+          
+          // Reset interruption tracking
+          lastInterimText = ""
+          lastInterimTime = 0
           
           // Reset latency tracking
           sttStartTs = Date.now()
