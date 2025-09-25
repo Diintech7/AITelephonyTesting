@@ -38,13 +38,13 @@ const ELEVEN_CONFIG = {
 
 // Latency optimization constants
 const LATENCY_CONFIG = {
-  INTERIM_MIN_WORDS: 2,           // Minimum words to trigger interim processing
-  INTERIM_DEBOUNCE_MS: 150,       // Reduced from 450ms
-  CONFIDENCE_THRESHOLD: 0.7,       // Minimum confidence for interim processing
-  WORD_ACCUMULATION_MS: 200,      // Time to accumulate words before sending to LLM
-  TTS_MIN_CHARS: 8,              // Reduced from 10
-  TTS_DEBOUNCE_MS: 120,          // Reduced from 180ms
-  SILENCE_DETECTION_MS: 300,      // Stop TTS if user starts speaking
+  INTERIM_MIN_WORDS: 1,           // Minimum words to trigger interim processing
+  INTERIM_DEBOUNCE_MS: 100,       // Further reduced for faster response
+  CONFIDENCE_THRESHOLD: 0.6,       // Lower confidence threshold for faster processing
+  WORD_ACCUMULATION_MS: 150,      // Reduced time to accumulate words
+  TTS_MIN_CHARS: 3,              // Further reduced for faster TTS
+  TTS_DEBOUNCE_MS: 80,           // Much faster debounce
+  SILENCE_DETECTION_MS: 200,      // Faster silence detection
 }
 
 // Timestamp helper with milliseconds
@@ -103,6 +103,31 @@ const downsamplePcm16kTo8kBase64 = (pcm16kBase64) => {
     console.log(`[${ts()}] [RESAMPLE] error ${e.message}`)
     console.log(pcm16kBase64)
     return pcm16kBase64
+  }
+}
+
+// Downsample raw PCM 16-bit mono from 16kHz to 8kHz (Buffer version)
+const downsamplePcm16kTo8k = (pcm16kBuf) => {
+  const start = Date.now()
+  try {
+    const samples = Math.floor(pcm16kBuf.length / 2)
+    if (samples <= 0) return pcm16kBuf
+    const dst = Buffer.alloc(Math.floor(pcm16kBuf.length / 2))
+    // Copy every other 16-bit sample (little-endian)
+    let di = 0
+    for (let si = 0; si < samples; si += 2) {
+      const byteIndex = si * 2
+      if (byteIndex + 1 < pcm16kBuf.length && di + 1 < dst.length) {
+        dst[di++] = pcm16kBuf[byteIndex]
+        dst[di++] = pcm16kBuf[byteIndex + 1]
+      }
+    }
+    const ms = Date.now() - start
+    console.log(`[${ts()}] [DOWNSAMPLE] 16k_to_8k_ms=${ms} in_bytes=${pcm16kBuf.length} out_bytes=${dst.length}`)
+    return dst
+  } catch (e) {
+    console.log(`[${ts()}] [DOWNSAMPLE] error ${e.message}`)
+    return pcm16kBuf
   }
 }
 
@@ -222,11 +247,16 @@ const elevenLabsStreamTTS = async (text, ws, ids, sessionId) => {
             if (firstByte === 0x7B || firstByte === 0x5B) { // '{' or '['
               asText = data.toString('utf8')
             } else {
-              // Binary path: treat as raw PCM8k mono (already 8k from ElevenLabs)
-              const pcm8kBuf = data
+              // Binary path: treat as raw PCM16k mono from ElevenLabs, downsample to 8k
+              const pcm16kBuf = data
               if (!firstAudioAt) firstAudioAt = Date.now()
-              const b64 = pcm8kBuf.toString('base64')
-              console.log(`[${ts()}] [11L-AUDIO-BIN] bytes=${pcm8kBuf.length} (8kHz) preview_base64=${b64.slice(0,64)}...`)
+              const b64 = pcm16kBuf.toString('base64')
+              console.log(`[${ts()}] [11L-AUDIO-BIN] bytes=${pcm16kBuf.length} (16kHz) preview_base64=${b64.slice(0,64)}...`)
+              
+              // Downsample 16kHz to 8kHz by taking every 2nd sample
+              const pcm8kBuf = downsamplePcm16kTo8k(pcm16kBuf)
+              console.log(`[${ts()}] [11L-DOWNSAMPLE] 16k_bytes=${pcm16kBuf.length} 8k_bytes=${pcm8kBuf.length}`)
+              
               // Accumulate until we have enough for multiple 20ms frames (320 bytes @ 8kHz)
               pcm8kAcc = Buffer.concat([pcm8kAcc, pcm8kBuf])
               if (pcm8kAcc.length >= FRAME_BYTES * 5) { // ~100ms
@@ -251,18 +281,24 @@ const elevenLabsStreamTTS = async (text, ws, ids, sessionId) => {
               console.log(`[${ts()}] [11L-WS-MSG] keys=${Object.keys(msg).join(',')} `)
             }
             if (msg?.audio) {
-              // audio is base64 PCM at 8000 Hz (requested)
+              // audio is base64 PCM at 16000 Hz from ElevenLabs, downsample to 8k
               const base64Audio = msg.audio
               if (!base64Audio || typeof base64Audio !== 'string' || base64Audio.length === 0) {
                 console.log(`[${ts()}] [11L-AUDIO-EMPTY] received empty/invalid audio field`)
                 return
               }
               console.log(`[${ts()}] [11L-AUDIO-JSON] base64_len=${base64Audio.length} preview=${base64Audio.slice(0,64)}...`)
-              const pcm8kBuf = Buffer.from(base64Audio, 'base64')
-              const sampleCount = Math.floor(pcm8kBuf.length / 2)
+              const pcm16kBuf = Buffer.from(base64Audio, 'base64')
+              const sampleCount16k = Math.floor(pcm16kBuf.length / 2)
               if (!firstAudioAt) firstAudioAt = Date.now()
-              console.log(`[${ts()}] [11L-AUDIO-PCM16] sr=8000Hz ch=1 bytes=${pcm8kBuf.length} samples=${sampleCount}`)
-              // Directly accumulate 8k audio
+              console.log(`[${ts()}] [11L-AUDIO-PCM16] sr=16000Hz ch=1 bytes=${pcm16kBuf.length} samples=${sampleCount16k}`)
+              
+              // Downsample 16kHz to 8kHz by taking every 2nd sample
+              const pcm8kBuf = downsamplePcm16kTo8k(pcm16kBuf)
+              const sampleCount8k = Math.floor(pcm8kBuf.length / 2)
+              console.log(`[${ts()}] [11L-DOWNSAMPLE-JSON] 16k_samples=${sampleCount16k} 8k_samples=${sampleCount8k}`)
+              
+              // Accumulate 8k audio
               pcm8kAcc = Buffer.concat([pcm8kAcc, pcm8kBuf])
               if (pcm8kAcc.length >= FRAME_BYTES * 5) {
                 const fullFrames = Math.floor(pcm8kAcc.length / FRAME_BYTES)
@@ -513,15 +549,15 @@ const setupSanPbxWebSocketServer = (ws) => {
     speakBuffer = ""
     if (!chunk) return
     
-    // Stricter minimum length to prevent TTS errors
-    if (chunk.length < 5 && reason !== "punct" && reason !== "force") {
+    // More lenient minimum length for better word flow
+    if (chunk.length < 3 && reason !== "punct" && reason !== "force") {
       console.log(`[${ts()}] [TTS-SKIP-FLUSH] too_short="${chunk}" reason=${reason}`)
       speakBuffer = chunk // Put it back for accumulation
       return
     }
     
-    // Limit TTS queue size to prevent backup
-    if (ttsQueue.length >= 3) {
+    // Increase TTS queue size for better buffering
+    if (ttsQueue.length >= 5) {
       console.log(`[${ts()}] [TTS-QUEUE-LIMIT] dropping chunk="${chunk}" queue_size=${ttsQueue.length}`)
       return
     }
@@ -540,9 +576,9 @@ const setupSanPbxWebSocketServer = (ws) => {
       return
     }
     
-    // Filter out very short chunks that cause TTS errors
+    // More lenient filtering for better word flow
     const cleanText = text.trim()
-    if (cleanText.length < 3 && !force) {
+    if (cleanText.length < 2 && !force) {
       console.log(`[${ts()}] [TTS-SKIP] too_short="${cleanText}"`)
       return
     }
@@ -554,11 +590,11 @@ const setupSanPbxWebSocketServer = (ws) => {
     const wordCount = speakBuffer.trim().split(/\s+/).filter(Boolean).length
     const punctNow = PUNCTUATION_FLUSH.test(speakBuffer)
     
-    // More conservative flushing to prevent breaks
+    // More aggressive flushing for lower latency
     const shouldImmediate = force || 
                            punctNow || 
-                           bufLen >= 80 ||  // Increased threshold
-                           wordCount >= 12  // More words before flushing
+                           bufLen >= 60 ||  // Reduced threshold for faster response
+                           wordCount >= 8   // Fewer words before flushing
     
     if (shouldImmediate) {
       if (speakDebounceTimer) { 
@@ -569,9 +605,9 @@ const setupSanPbxWebSocketServer = (ws) => {
       return
     }
     
-    // Longer debounce to accumulate more text
+    // Shorter debounce for lower latency
     if (speakDebounceTimer) clearTimeout(speakDebounceTimer)
-    speakDebounceTimer = setTimeout(() => flushSpeakBuffer("debounce"), 300) // Increased from 120ms
+    speakDebounceTimer = setTimeout(() => flushSpeakBuffer("debounce"), 150) // Reduced from 300ms
   }
   
   const processTTSQueue = async () => {
@@ -639,9 +675,9 @@ const setupSanPbxWebSocketServer = (ws) => {
       
       console.log(`[${ts()}] [TRANSCRIPT-${isFinal ? 'FINAL' : 'INTERIM'}] words=${wordCount} conf=${confidence.toFixed(2)} text="${clean}"`)
       
-      // Only process final transcripts OR high-quality long interim transcripts
+      // Process final transcripts OR high-quality interim transcripts for faster response
       const shouldProcess = isFinal || 
-                           (wordCount >= 4 && confidence >= 0.8 && !isFinal) // More selective interim processing
+                           (wordCount >= 2 && confidence >= 0.6 && !isFinal) // More aggressive interim processing
       
       if (!shouldProcess) return
       
@@ -655,15 +691,16 @@ const setupSanPbxWebSocketServer = (ws) => {
       let lastLen = 0
       let responseText = ""
       
-      // Less aggressive flushing to prevent sentence breaks
+      // More aggressive flushing for lower latency while preserving word boundaries
       const shouldFlush = (prev, curr) => {
         const diff = curr.slice(prev).trim()
         const words = diff.split(/\s+/).filter(Boolean).length
         
-        // Only flush on natural breakpoints
-        if (words >= 8) return true // Longer chunks
+        // Flush on natural breakpoints for better responsiveness
+        if (words >= 4) return true // Shorter chunks for faster response
         if (/[.!?]\s*$/.test(diff)) return true // Sentence endings
-        if (diff.length >= 50) return true // Long chunks
+        if (/[,;:]\s*$/.test(diff)) return true // Comma/semicolon breaks
+        if (diff.length >= 30) return true // Shorter chunks
         
         return false
       }
