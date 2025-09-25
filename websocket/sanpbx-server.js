@@ -168,10 +168,9 @@ const streamPcmToSanPBX = async (ws, { streamId, callId, channelId }, pcmBase64,
     
     position += CHUNK_SIZE
     
-    // Adaptive delay based on priority
+    // Fixed 20ms pacing for stable SIP playback
     if (position < audioBuffer.length) {
-      const delay = priority === 'high' ? 15 : 20
-      await new Promise(r => setTimeout(r, delay))
+      await new Promise(r => setTimeout(r, 20))
     }
     
     if (sentChunks % 50 === 0) {
@@ -618,16 +617,18 @@ class ConversationHistory {
     const hasEnoughWords = wordCount >= LATENCY_CONFIG.INTERIM_MIN_WORDS
     
     // FIXED: Filter out common false positives
-    const isFillerWords = /^(hello|hi|hey|um|uh|er|ah|hmm|well|okay|ok|yes|no|yeah|yep|nope|what|huh|sorry)(\s|$)/i.test(clean)
+    const isFillerWords = /^(um|uh|er|ah|hmm|well|okay|ok|yes|no|yeah|yep|nope|what|huh|sorry)(\s|$)/i.test(clean)
     const isNoiseOrGibberish = /^[^a-zA-Z]*$/.test(clean) || clean.length < 3
     const isRepeatedChar = /^(.)\1+$/.test(clean)
+    const isOnlyPunct = /^[\p{P}\p{S}\s]+$/u.test(clean)
     
     // FIXED: Require substantial, meaningful speech
     const hasSubstance = isLongEnough && 
                         hasEnoughWords && 
                         !isFillerWords && 
                         !isNoiseOrGibberish && 
-                        !isRepeatedChar
+                        !isRepeatedChar &&
+                        !isOnlyPunct
     
     if (!hasSubstance) {
       console.log(`[${ts()}] [INTERIM-FILTERED] text="${clean}" words=${wordCount} len=${clean.length} substance=${hasSubstance}`)
@@ -797,6 +798,15 @@ const setupSanPbxWebSocketServer = (ws) => {
     
     // FIXED: More lenient queue size management
     if (ttsQueue.length >= 3) {
+      // Merge into the last queued item to avoid dropping audio
+      const last = ttsQueue[ttsQueue.length - 1]
+      if (last && typeof last.text === 'string') {
+        last.text = (last.text + ' ' + chunk).trim()
+        last.isComplete = isCompleteSentence(last.text)
+        last.timestamp = Date.now()
+        console.log(`[${ts()}] [TTS-QUEUE-MERGE] merged_into_last new_len=${last.text.length} complete=${last.isComplete}`)
+        return
+      }
       console.log(`[${ts()}] [TTS-QUEUE-LIMIT] dropping chunk="${chunk}" queue_size=${ttsQueue.length}`)
       return
     }
