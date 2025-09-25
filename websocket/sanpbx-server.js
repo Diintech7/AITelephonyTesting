@@ -152,11 +152,6 @@ const streamPcmToSanPBX = async (ws, { streamId, callId, channelId }, pcmBase64,
     const chunk = audioBuffer.slice(position, position + CHUNK_SIZE)
     const padded = chunk.length < CHUNK_SIZE ? Buffer.concat([chunk, Buffer.alloc(CHUNK_SIZE - chunk.length)]) : chunk
     const message = { event: "reverse-media", payload: padded.toString('base64'), streamId, channelId, callId }
-    
-    // Debug: log exact base64 payload sent to SIP
-    try {
-      console.log(`[${ts()}] [SIP-AUDIO-CHUNK] session=${sessionId || 'n/a'} base64=${message.payload}`)
-    } catch (_) {}
 
     try { 
       ws.send(JSON.stringify(message)) 
