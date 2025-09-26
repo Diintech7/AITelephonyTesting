@@ -17,7 +17,7 @@ if (!API_KEYS.deepgram || !API_KEYS.sarvam || !API_KEYS.openai) {
 
 const STATIC = {
   language: "en",
-  deepgramLanguage: "en",
+  deepgramLanguage: "hi",
   sarvamLanguage: "en-IN",
   sarvamVoice: "pavithra",
   systemPrompt: [
