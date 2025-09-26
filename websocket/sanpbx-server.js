@@ -810,6 +810,8 @@ const setupSanPbxWebSocketServer = (ws) => {
       currentTTSSession += 1
       ws.lastTTSSessionChange = Date.now()
       console.log(`[${ts()}] [INTERRUPTION] cleared_queue_only old_session=${oldSession} new_session=${currentTTSSession}`)
+      // Abort only the currently playing SIP audio tied to the old session
+      try { abortSipQueue(ws, oldSession) } catch (_) {}
       return true
     }
     return true
