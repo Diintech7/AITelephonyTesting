@@ -1074,9 +1074,9 @@ const setupSanPbxWebSocketServer = (ws) => {
         
         // Prioritize complete thoughts
         if (/[.!?]\s*$/.test(newContent)) return true
-        if (sentences > 1) return true
-        if (words >= 5 && /[,;:]\s*$/.test(newContent)) return true
-        if (newContent.length >= 60) return true
+        if (sentences > 2) return true
+        if (words >= 10 && /[,;:]\s*$/.test(newContent)) return true
+        if (newContent.length >= 80) return true
         
         return false
       }
